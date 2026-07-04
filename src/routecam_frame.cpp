@@ -212,7 +212,7 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
       "Action camera video{.MP4,.mp4,.mov,.MOV,.360}",
       cfg);
   }
-  if (ImGuiFileDialog::Instance()->Display("GoProOpenDlg")) {
+  if (ImGuiFileDialog::Instance()->Display("RouteCamOpenDlg")) {
     if (ImGuiFileDialog::Instance()->IsOk()) {
       std::string const picked = ImGuiFileDialog::Instance()->GetFilePathName();
       if (!LoadFile(picked)) {
