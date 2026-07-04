@@ -56,6 +56,12 @@ endif()
 if(WIN32)
   set(MNEXUS_ENABLE_VIDEO_CODING ON CACHE BOOL "" FORCE)
 endif()
+# routecam (via mshell) hard-selects the Vulkan backend. Disable the
+# WebGPU/Dawn backend so the build does not pull in Dawn and its ~78
+# recursive submodules -- a large chunk of configure + build time we
+# gain nothing from here.
+set(MNEXUS_ENABLE_BACKEND_WGPU OFF CACHE BOOL "" FORCE)
+set(MNEXUS_ENABLE_DAWN         OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mnexus       ${CMAKE_CURRENT_BINARY_DIR}/mnexus)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mslang       ${CMAKE_CURRENT_BINARY_DIR}/mslang)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mslang-proxy ${CMAKE_CURRENT_BINARY_DIR}/mslang-proxy)
