@@ -24,6 +24,9 @@
 #include "mplay/public/media_player.h"
 #include "mslang_proxy/public/mslang_proxy.h"
 
+// project headers ---------------------------------------
+#include "gps_timeline.h"
+
 namespace routecam {
 
 namespace {
@@ -42,6 +45,7 @@ struct RouteCamFrame::Impl final {
   bool             request_hdr_swapchain = false;
 
   std::unique_ptr<mplay::MediaPlayer> player;
+  std::unique_ptr<GpsTimeline>        gps_timeline;  // null when the file has no GPS
 
   mnexus::ShaderModuleHandle vs_handle      = {};
   mnexus::ShaderModuleHandle fs_handle      = {};
@@ -150,6 +154,7 @@ bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
   // session limits + audio sink double-binding both crash if two
   // players try to coexist across an Open call).
   impl_->player.reset();
+  impl_->gps_timeline.reset();
 
   auto new_player = mplay::MediaPlayer::Open(impl_->device, mplay::OpenMp4Desc{
     .path                 = path,
@@ -164,6 +169,9 @@ bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
 
   impl_->player   = std::move(new_player);
   impl_->mp4_path = path;
+
+  // GPS telemetry is optional; null just disables the HUD / map.
+  impl_->gps_timeline = GpsTimeline::Load(path);
 
   auto const& info = impl_->player->info();
   MBASE_LOG_INFO("RouteCamFrame::LoadFile: {} -- {}x{} {}-bit hdr10={} peak_nits={} frames={} dur={:.2f}s audio={}",
@@ -237,6 +245,11 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
       ImGui::Text("Display: %u / %u", cur + 1, total);
       ImGui::Text("PTS: %.3fs   Duration: %.2fs",
                   impl_->player->current_pts_seconds(), info.total_seconds);
+      if (impl_->gps_timeline != nullptr) {
+        ImGui::Text("GPS: %zu fixes", impl_->gps_timeline->points().size());
+      } else {
+        ImGui::TextDisabled("GPS: none");
+      }
 
       bool auto_play = impl_->player->auto_play();
       if (ImGui::Checkbox("Play", &auto_play)) {
@@ -290,6 +303,38 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
     }
   }
   ImGui::End();
+
+  // ----- Speed HUD (bottom-left corner overlay) ---------
+  // Prototype of the burn-in overlay: same data path the transcoder
+  // will use, rendered with ImGui for now.
+  if (impl_->player != nullptr && impl_->gps_timeline != nullptr) {
+    std::optional<mgpmf::Gps9> const fix =
+      impl_->gps_timeline->SampleAt(impl_->player->current_pts_seconds());
+    if (fix.has_value()) {
+      ImGuiViewport const* viewport = ImGui::GetMainViewport();
+      constexpr float kPadding = 16.0f;
+      ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + kPadding,
+               viewport->WorkPos.y + viewport->WorkSize.y - kPadding),
+        ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+      ImGui::SetNextWindowBgAlpha(0.35f);
+      ImGuiWindowFlags const hud_flags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoInputs;
+      if (ImGui::Begin("##SpeedHud", nullptr, hud_flags)) {
+        ImGui::SetWindowFontScale(2.5f);
+        ImGui::Text("%5.1f km/h", fix->speed_2d * 3.6f);
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::TextDisabled("alt %5.0f m   %s  dop %.1f",
+                            fix->altitude,
+                            fix->fix >= 3 ? "3D" : "2D",
+                            fix->dop);
+      }
+      ImGui::End();
+    }
+  }
 }
 
 void RouteCamFrame::OnRender(mshell::RenderContext const& ctx) {

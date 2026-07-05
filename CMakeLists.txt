@@ -69,6 +69,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mslang-proxy ${CMAKE_CURRENT_BIN
 # Media stack used by RouteCamFrame.
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../maudio   ${CMAKE_CURRENT_BINARY_DIR}/maudio)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mdemux   ${CMAKE_CURRENT_BINARY_DIR}/mdemux)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mgpmf    ${CMAKE_CURRENT_BINARY_DIR}/mgpmf)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../maacdec  ${CMAKE_CURRENT_BINARY_DIR}/maacdec)
 if(WIN32)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mhevcdec ${CMAKE_CURRENT_BINARY_DIR}/mhevcdec)
@@ -82,6 +83,8 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mshell ${CMAKE_CURRENT_BINARY_DI
 
 set(SOURCE_DIR "src")
 set(SOURCES
+  ${SOURCE_DIR}/gps_timeline.cpp
+  ${SOURCE_DIR}/gps_timeline.h
   ${SOURCE_DIR}/main.cpp
   ${SOURCE_DIR}/routecam_frame.h
   ${SOURCE_DIR}/routecam_frame.cpp
@@ -98,6 +101,7 @@ target_sources(${TARGET_NAME} PRIVATE ${SOURCES})
 
 target_link_libraries(${TARGET_NAME} PRIVATE
   mbase
+  mgpmf
   mshell
   mplay
 )
