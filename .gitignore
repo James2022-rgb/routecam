@@ -3,3 +3,4 @@ build/
 log/
 imgui.ini
 *.log
+slang_cache/
