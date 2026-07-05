@@ -10,6 +10,7 @@
 #include "imgui.h"
 
 // project headers ---------------------------------------
+#include "hud_draw.h"
 #include "slippy_map.h"
 
 namespace routecam {
@@ -29,6 +30,7 @@ constexpr size_t kMaxPolylinePoints = 1500;
 void DrawMinimap(OsmTileCache&      tiles,
                  GpsTimeline const& timeline,
                  mgpmf::Gps9 const& current_fix,
+                 double             current_pts_seconds,
                  int&               io_zoom) {
   io_zoom = std::clamp(io_zoom, kMinZoom, kMaxZoom);
 
@@ -108,43 +110,34 @@ void DrawMinimap(OsmTileCache&      tiles,
     }
   }
 
-  // ----- Track polyline --------------------------------
+  // ----- Track polyline (traversed part highlighted) ----
   {
     std::span<GpsPoint const> const points = timeline.points();
     size_t const stride = std::max<size_t>(1, points.size() / kMaxPolylinePoints);
     std::vector<ImVec2> screen_points;
     screen_points.reserve(points.size() / stride + 2);
+    int traversed = 0;
     for (size_t i = 0; i < points.size(); i += stride) {
       double tx = 0.0, ty = 0.0;
       LatLonToTileXY(points[i].gps.latitude, points[i].gps.longitude, io_zoom, tx, ty);
       screen_points.push_back(TileToScreen(tx, ty));
+      if (points[i].pts_seconds <= current_pts_seconds) {
+        traversed = static_cast<int>(screen_points.size());
+      }
     }
-    if (screen_points.size() >= 2) {
-      // Dark casing under a bright line for contrast on any map style.
-      draw->AddPolyline(screen_points.data(), static_cast<int>(screen_points.size()),
-                        IM_COL32(20, 40, 90, 200), ImDrawFlags_None, 5.0f);
-      draw->AddPolyline(screen_points.data(), static_cast<int>(screen_points.size()),
-                        IM_COL32(60, 140, 255, 255), ImDrawFlags_None, 2.5f);
-    }
+    hud::DrawTrackPolyline(draw, screen_points.data(),
+                           static_cast<int>(screen_points.size()),
+                           traversed, /*scale=*/1.0f);
   }
 
   // ----- Position marker -------------------------------
-  draw->AddCircleFilled(map_center, 7.0f, IM_COL32(255, 255, 255, 255));
-  draw->AddCircleFilled(map_center, 5.0f, IM_COL32(230, 60, 60, 255));
+  hud::DrawPositionMarker(draw, map_center, /*scale=*/1.0f);
 
   // ----- Attribution (required by the OSM tile policy) --
-  {
-    char const* const attribution = "(c) OpenStreetMap";
-    ImVec2 const text_size = ImGui::CalcTextSize(attribution);
-    ImVec2 const text_pos  = ImVec2(map_max.x - text_size.x - 4.0f,
-                                    map_max.y - text_size.y - 2.0f);
-    draw->AddRectFilled(ImVec2(text_pos.x - 3.0f, text_pos.y - 1.0f), map_max,
-                        IM_COL32(255, 255, 255, 160));
-    draw->AddText(text_pos, IM_COL32(60, 60, 60, 255), attribution);
-  }
+  hud::DrawOsmAttribution(draw, map_min, map_max, /*scale=*/1.0f);
 
   draw->PopClipRect();
-  draw->AddRect(map_min, map_max, IM_COL32(255, 255, 255, 90));  // frame
+  hud::DrawMapFrame(draw, map_min, map_max);
 
   ImGui::End();
 }

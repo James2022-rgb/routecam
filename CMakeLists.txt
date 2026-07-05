@@ -88,6 +88,8 @@ set(SOURCE_DIR "src")
 set(SOURCES
   ${SOURCE_DIR}/gps_timeline.cpp
   ${SOURCE_DIR}/gps_timeline.h
+  ${SOURCE_DIR}/hud_draw.cpp
+  ${SOURCE_DIR}/hud_draw.h
   ${SOURCE_DIR}/main.cpp
   ${SOURCE_DIR}/minimap.cpp
   ${SOURCE_DIR}/minimap.h

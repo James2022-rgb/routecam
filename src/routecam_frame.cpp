@@ -27,6 +27,7 @@
 
 // project headers ---------------------------------------
 #include "gps_timeline.h"
+#include "hud_draw.h"
 #include "minimap.h"
 #include "osm_tile_cache.h"
 #include "transcode_session.h"
@@ -454,38 +455,49 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
   ImGui::End();
 
   // ----- Speed HUD (bottom-left corner overlay) ---------
-  // Prototype of the burn-in overlay: same data path the transcoder
-  // will use, rendered with ImGui for now.
+  // Same shared drawing code (hud_draw) the burn-in transcoder
+  // uses, so playback previews exactly what gets burned in.
   if (impl_->player != nullptr && impl_->gps_timeline != nullptr) {
-    std::optional<mgpmf::Gps9> const fix =
-      impl_->gps_timeline->SampleAt(impl_->player->current_pts_seconds());
+    double const pts = impl_->player->current_pts_seconds();
+    std::optional<mgpmf::Gps9> const fix = impl_->gps_timeline->SampleAt(pts);
     if (fix.has_value()) {
       ImGuiViewport const* viewport = ImGui::GetMainViewport();
-      constexpr float kPadding = 16.0f;
+      constexpr float kPadding     = 16.0f;
+      constexpr float kGaugeRadius = 90.0f;
       ImGui::SetNextWindowPos(
         ImVec2(viewport->WorkPos.x + kPadding,
                viewport->WorkPos.y + viewport->WorkSize.y - kPadding),
         ImGuiCond_Always, ImVec2(0.0f, 1.0f));
-      ImGui::SetNextWindowBgAlpha(0.35f);
+      ImGui::SetNextWindowBgAlpha(0.0f);  // the gauge draws its own dial face
       ImGuiWindowFlags const hud_flags =
         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
         ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoInputs;
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
       if (ImGui::Begin("##SpeedHud", nullptr, hud_flags)) {
-        ImGui::SetWindowFontScale(2.5f);
-        ImGui::Text("%5.1f km/h", fix->speed_2d * 3.6f);
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::TextDisabled("alt %5.0f m   %s  dop %.1f",
-                            fix->altitude,
-                            fix->fix >= 3 ? "3D" : "2D",
-                            fix->dop);
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        ImVec2 const wp = ImGui::GetCursorScreenPos();
+        ImVec2 const gauge_center(wp.x + kGaugeRadius, wp.y + kGaugeRadius);
+        hud::DrawSpeedGauge(dl, gauge_center, kGaugeRadius,
+                            fix->speed_2d * 3.6f);
+        ImGui::Dummy(ImVec2(kGaugeRadius * 2.0f, kGaugeRadius * 2.0f));
+
+        char info[64];
+        std::snprintf(info, sizeof(info), "alt %5.0f m   %s  dop %.1f",
+                      fix->altitude,
+                      fix->fix >= 3 ? "3D" : "2D",
+                      fix->dop);
+        ImVec2 const info_sz = ImGui::CalcTextSize(info);
+        ImGui::SetCursorPosX((kGaugeRadius * 2.0f - info_sz.x) * 0.5f);
+        ImGui::TextDisabled("%s", info);
       }
       ImGui::End();
+      ImGui::PopStyleVar();
 
       // ----- Minimap (bottom-right corner overlay) ------
       if (impl_->show_minimap && impl_->tile_cache != nullptr) {
-        DrawMinimap(*impl_->tile_cache, *impl_->gps_timeline, *fix,
+        DrawMinimap(*impl_->tile_cache, *impl_->gps_timeline, *fix, pts,
                     impl_->minimap_zoom);
       }
     }

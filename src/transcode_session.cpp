@@ -32,6 +32,7 @@
 #include "mslang_proxy/public/mslang_proxy.h"
 
 // project headers ---------------------------------------
+#include "hud_draw.h"
 #include "osm_minimap.h"
 
 namespace routecam {
@@ -51,15 +52,15 @@ constexpr uint32_t                kVideoTimescale = 30000;
 // and matches what the demuxer-side ASC defines.
 constexpr uint32_t                kAacSamplesPerAu = 1024;
 
-// Overlay RT dimensions + dest-picture placement. The overlay is
-// drawn into its own RGBA8 render target via a secondary
-// ImguiRenderer instance (sharing the primary's font atlas); the
-// compose shaders then sample it at the right region of the dest
-// picture.
-constexpr uint32_t kOverlayWidth   = 1280;
-constexpr uint32_t kOverlayHeight  = 320;
-constexpr uint32_t kOverlayMarginX = 32;
-constexpr uint32_t kOverlayMarginY = 32;
+// The overlay RT matches the encode dimensions 1:1 (u_overlay_rect
+// spans the whole picture), so HUD elements land pixel-exact on the
+// output. Layout matches the playback overlays: speed gauge bottom-
+// left, minimap bottom-right, both scaled by encode_height / 720 so
+// the design keeps playback proportions at any output resolution.
+constexpr float kHudDesignHeight = 720.0f;
+constexpr float kHudPaddingPx    = 16.0f;   // at design scale
+constexpr float kGaugeRadiusPx   = 90.0f;   // at design scale
+constexpr float kMapSizePx       = 280.0f;  // at design scale
 
 // Number of encode-input slots in the ping-pong. mhevcenc enforces
 // at most one outstanding SubmitPicture, but the input texture can
@@ -120,62 +121,6 @@ mnexus::ShaderModuleHandle CompileSlangModule(
   return h;
 }
 
-// ---- 7-segment digit primitive ---------------------------
-//
-// Drawn via ImDrawList::AddRectFilled rather than scaled-up ImGui
-// font glyphs so the central readout stays crisp at any size -- the
-// atlas is baked at ~15 px and naive 3-4x text upscaling visibly
-// blurs.
-uint8_t SevenSegBits(int digit) {
-  static const uint8_t k[10] = {
-    0b0111111, // 0: abcdef
-    0b0000110, // 1: bc
-    0b1011011, // 2: abdeg
-    0b1001111, // 3: abcdg
-    0b1100110, // 4: bcfg
-    0b1101101, // 5: acdfg
-    0b1111101, // 6: acdefg
-    0b0000111, // 7: abc
-    0b1111111, // 8: abcdefg
-    0b1101111, // 9: abcdfg
-  };
-  if (digit < 0 || digit > 9) return 0;
-  return k[digit];
-}
-
-void DrawSevenSeg(ImDrawList* dl, ImVec2 p, float w, float h, int digit,
-                  ImU32 col_on, ImU32 col_off) {
-  uint8_t const segs = SevenSegBits(digit);
-  float const t  = h * 0.12f;             // segment thickness
-  float const vh = (h - 3.0f * t) * 0.5f; // vertical segment length
-  float const hw = w - 2.0f * t;          // horizontal segment length
-
-  auto seg = [&](ImVec2 a, ImVec2 b, bool on) {
-    dl->AddRectFilled(a, b, on ? col_on : col_off, t * 0.35f);
-  };
-  // a: top horizontal
-  seg(ImVec2(p.x + t,        p.y),
-      ImVec2(p.x + t + hw,   p.y + t),                       (segs >> 0) & 1);
-  // b: top-right vertical
-  seg(ImVec2(p.x + w - t,    p.y + t),
-      ImVec2(p.x + w,        p.y + t + vh),                  (segs >> 1) & 1);
-  // c: bottom-right vertical
-  seg(ImVec2(p.x + w - t,    p.y + t + vh + t),
-      ImVec2(p.x + w,        p.y + t + vh + t + vh),         (segs >> 2) & 1);
-  // d: bottom horizontal
-  seg(ImVec2(p.x + t,        p.y + h - t),
-      ImVec2(p.x + t + hw,   p.y + h),                       (segs >> 3) & 1);
-  // e: bottom-left vertical
-  seg(ImVec2(p.x,            p.y + t + vh + t),
-      ImVec2(p.x + t,        p.y + t + vh + t + vh),         (segs >> 4) & 1);
-  // f: top-left vertical
-  seg(ImVec2(p.x,            p.y + t),
-      ImVec2(p.x + t,        p.y + t + vh),                  (segs >> 5) & 1);
-  // g: middle horizontal
-  seg(ImVec2(p.x + t,        p.y + t + vh),
-      ImVec2(p.x + t + hw,   p.y + t + vh + t),              (segs >> 6) & 1);
-}
-
 } // namespace
 
 struct TranscodeSession::Impl final {
@@ -215,9 +160,7 @@ struct TranscodeSession::Impl final {
     double   lng            = 0.0;
   };
   std::vector<RouteEntry>     route;
-  std::unique_ptr<OsmMinimap> osm_minimap;        // whole-route overview
-  mnexus::TextureHandle       minimap_tex;
-  std::unique_ptr<OsmMinimap> osm_minimap_local;  // street-level detail
+  std::unique_ptr<OsmMinimap> osm_minimap_local;  // street-level detail mosaic
   mnexus::TextureHandle       minimap_local_tex;
 
   // ---- Overlay rendering ----------------------------------
@@ -288,7 +231,6 @@ struct TranscodeSession::Impl final {
     aac_demux.reset();
     gpmf_demux.reset();
     cached_gpmf.reset();
-    osm_minimap.reset();
     osm_minimap_local.reset();
     route.clear();
     player.reset();
@@ -308,7 +250,6 @@ struct TranscodeSession::Impl final {
       if (linear_sampler.IsValid())       device->DestroySampler(linear_sampler);
       if (compose_ubo.IsValid())          device->DestroyBuffer(compose_ubo);
       if (overlay_rgba_tex.IsValid())     device->DestroyTexture(overlay_rgba_tex);
-      if (minimap_tex.IsValid())          device->DestroyTexture(minimap_tex);
       if (minimap_local_tex.IsValid())    device->DestroyTexture(minimap_local_tex);
       DestroyEncodeResources();
     }
@@ -375,19 +316,6 @@ struct TranscodeSession::Impl final {
     overlay_drawlist = new ImDrawList(ImGui::GetDrawListSharedData());
 
     // ---- Fixed GPU resources -------------------------------
-    overlay_rgba_tex = device->CreateTexture(mnexus::TextureDesc{
-      .usage             = mnexus::TextureUsageFlagBits::kAttachment
-                         | mnexus::TextureUsageFlagBits::kSampled,
-      .format            = mnexus::Format::kR8G8B8A8_UNORM,
-      .dimension         = mnexus::TextureDimension::k2D,
-      .width             = kOverlayWidth,
-      .height            = kOverlayHeight,
-      .depth             = 1,
-      .mip_level_count   = 1,
-      .array_layer_count = 1,
-    });
-    if (!overlay_rgba_tex.IsValid()) return false;
-
     // 3 vec4: rotation row0 + row1 + overlay rect.
     compose_ubo = device->CreateBuffer(mnexus::BufferDesc{
       .usage         = mnexus::BufferUsageFlagBits::kUniform,
@@ -435,6 +363,21 @@ struct TranscodeSession::Impl final {
     }
     MBASE_LOG_INFO("TranscodeSession: {} frames @ {}x{} (scale 1/{}) -> {}",
       total_frames, encode_width, encode_height, scale, desc.output_path);
+
+    // Overlay RT matches the encode dims 1:1 so HUD pixels land
+    // exactly on output pixels (no compose-time rescale blur).
+    overlay_rgba_tex = device->CreateTexture(mnexus::TextureDesc{
+      .usage             = mnexus::TextureUsageFlagBits::kAttachment
+                         | mnexus::TextureUsageFlagBits::kSampled,
+      .format            = mnexus::Format::kR8G8B8A8_UNORM,
+      .dimension         = mnexus::TextureDimension::k2D,
+      .width             = encode_width,
+      .height            = encode_height,
+      .depth             = 1,
+      .mip_level_count   = 1,
+      .array_layer_count = 1,
+    });
+    if (!overlay_rgba_tex.IsValid()) return false;
 
     if (!AllocateEncodeResources()) {
       MBASE_LOG_ERROR("TranscodeSession: AllocateEncodeResources failed");
@@ -542,19 +485,12 @@ struct TranscodeSession::Impl final {
         case 270: a =  0.0f; b =  1.0f; c = -1.0f; d =  0.0f; break;
         default:  break;
       }
-      // Overlay rect normalised against the encode dims, with NO
-      // clamping. If the rect extends past the picture (heavily
-      // downscaled encode) the shader's `ov_uv > 1` check ignores
-      // the off-picture portion -- the visible part stays 1:1 in
-      // pixels, so circles stay circles.
-      float const ov_min_x = static_cast<float>(kOverlayMarginX) / static_cast<float>(encode_width);
-      float const ov_min_y = static_cast<float>(kOverlayMarginY) / static_cast<float>(encode_height);
-      float const ov_max_x = static_cast<float>(kOverlayMarginX + kOverlayWidth)  / static_cast<float>(encode_width);
-      float const ov_max_y = static_cast<float>(kOverlayMarginY + kOverlayHeight) / static_cast<float>(encode_height);
+      // Overlay rect spans the whole picture: the RT is allocated at
+      // the encode dims, so overlay UV == picture UV, 1:1 pixels.
       float const ubo_data[12] = {
-        a,        b,        0.0f,     0.0f,      // u_uv_rotation_row0
-        c,        d,        0.0f,     0.0f,      // u_uv_rotation_row1
-        ov_min_x, ov_min_y, ov_max_x, ov_max_y,  // u_overlay_rect
+        a,    b,    0.0f, 0.0f,  // u_uv_rotation_row0
+        c,    d,    0.0f, 0.0f,  // u_uv_rotation_row1
+        0.0f, 0.0f, 1.0f, 1.0f,  // u_overlay_rect
       };
       device->QueueWriteBuffer({}, compose_ubo, 0, ubo_data, sizeof(ubo_data));
     }
@@ -692,26 +628,9 @@ struct TranscodeSession::Impl final {
       return;
     }
 
-    // Overview mosaic -- whole route in a few low-zoom tiles.
-    {
-      OsmMinimap::PrepareConfig cfg{};
-      cfg.route     = route_points;
-      cfg.cache_dir = desc.map_cache_dir;
-      osm_minimap   = OsmMinimap::Prepare(cfg);
-      if (osm_minimap != nullptr) {
-        minimap_tex = UploadRgba8ToTexture(osm_minimap->base_map_rgba(),
-                                           osm_minimap->base_map_width(),
-                                           osm_minimap->base_map_height());
-        if (!minimap_tex.IsValid()) {
-          MBASE_LOG_WARN("TranscodeSession: overview minimap upload failed");
-          osm_minimap.reset();
-        }
-      } else {
-        MBASE_LOG_WARN("TranscodeSession: overview OsmMinimap::Prepare failed");
-      }
-    }
-
-    // Local-detail mosaic -- higher zoom capped at 16x16 tiles.
+    // Local-detail mosaic -- higher zoom capped at 16x16 tiles. The
+    // burned-in map draws a 1:1-pixel viewport of this mosaic that
+    // follows the current position, matching the playback minimap.
     {
       OsmMinimap::PrepareConfig cfg{};
       cfg.route       = std::move(route_points);
@@ -778,290 +697,102 @@ struct TranscodeSession::Impl final {
     ImDrawList* dl = overlay_drawlist;
     dl->_ResetForNewFrame();
 
-    ImVec2 const ov_size(static_cast<float>(kOverlayWidth),
-                         static_cast<float>(kOverlayHeight));
-    // Visible horizontal extent on the encoded picture: the overlay
-    // rect on dest is `[margin, margin + kOverlayWidth)`, truncated
-    // to encode_width at the right when the encode is small. Lay
-    // out the dashboard inside the truncated extent.
-    float const visible_w = encode_width > kOverlayMarginX
-      ? std::min<float>(static_cast<float>(kOverlayWidth),
-                        static_cast<float>(encode_width) - kOverlayMarginX)
-      : static_cast<float>(kOverlayWidth);
-
-    dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(visible_w, ov_size.y), false);
+    float const out_w = static_cast<float>(encode_width);
+    float const out_h = static_cast<float>(encode_height);
+    dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(out_w, out_h), false);
     dl->PushTextureID(ImGui::GetIO().Fonts->TexID);
 
-    dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(visible_w, ov_size.y),
-                      IM_COL32(0, 0, 0, 160), 8.0f);
+    // Telemetry for this frame. No fix (pre-lock lead-in / no GPMF)
+    // -> no HUD at all, matching the playback overlays.
+    std::optional<mgpmf::Gps9> gps;
+    if (cached_gpmf != nullptr) gps = cached_gpmf->gps9();
+    if (gps.has_value()) {
+      float const s   = out_h / kHudDesignHeight;
+      float const pad = kHudPaddingPx * s;
 
-    ImU32 const kCWhite  = IM_COL32(255, 255, 255, 255);
-    ImU32 const kCDim    = IM_COL32(180, 180, 180, 255);
-    ImU32 const kCRimHi  = IM_COL32(170, 185, 200, 255);
-    ImU32 const kCRimLo  = IM_COL32( 70,  85, 100, 255);
-    ImU32 const kCFill   = IM_COL32( 80, 220, 120, 240);
-    ImU32 const kCFillHi = IM_COL32(255, 110, 110, 240);
-    ImU32 const kCFace   = IM_COL32( 15,  20,  30, 240);
+      ImFont* font = ImGui::GetIO().Fonts->Fonts[0];
+      float const info_h = font->FontSize * s;
 
-    ImFont* font = ImGui::GetIO().Fonts->Fonts[0];
-    float const font_h = font->FontSize;
-    float const line_h = font_h * 1.2f;
+      // ----- Speed gauge (bottom-left) -------------------
+      float const r = kGaugeRadiusPx * s;
+      ImVec2 const gauge_center(pad + r, out_h - pad - info_h * 1.6f - r);
+      hud::DrawSpeedGauge(dl, gauge_center, r, gps->speed_2d * 3.6f);
 
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "Frame %u / %u", next_encode_frame, total_frames);
-    dl->AddText(ImVec2(16.0f, 6.0f), kCDim, buf);
+      // alt / fix / dop line centred under the gauge, on a subtle
+      // dark chip so it reads over any footage.
+      char info[64];
+      std::snprintf(info, sizeof(info), "alt %5.0f m   %s  dop %.1f",
+                    gps->altitude, gps->fix >= 3 ? "3D" : "2D", gps->dop);
+      ImVec2 const info_sz = font->CalcTextSizeA(info_h, FLT_MAX, 0.0f, info);
+      ImVec2 const info_pos(gauge_center.x - info_sz.x * 0.5f,
+                            out_h - pad - info_h * 1.3f);
+      dl->AddRectFilled(
+        ImVec2(info_pos.x - 4.0f * s, info_pos.y - 2.0f * s),
+        ImVec2(info_pos.x + info_sz.x + 4.0f * s, info_pos.y + info_sz.y + 2.0f * s),
+        IM_COL32(0, 0, 0, 120), 4.0f * s);
+      dl->AddText(font, info_h, info_pos, IM_COL32(200, 200, 200, 255), info);
 
-    // ---- Cockpit-style speedometer (center) ----
-    ImVec2 const speedo_center(visible_w * 0.5f, ov_size.y * 0.5f);
-    float const r_outer = ov_size.y * 0.47f;
-    float const r_rim   = r_outer - 4.0f;
-    float const r_track = r_outer - 16.0f;
+      // ----- Minimap (bottom-right) ----------------------
+      // Same design as the playback minimap: a square window of map
+      // pixels centred on the current position, casing polyline,
+      // marker, attribution. The mosaic is sampled 1:1 (viewport
+      // px == mosaic px) so tiles stay as crisp as in playback.
+      if (osm_minimap_local != nullptr && minimap_local_tex.IsValid() && !route.empty()) {
+        float const map_size = kMapSizePx * s;
+        ImVec2 const map_min(out_w - pad - map_size, out_h - pad - map_size);
+        ImVec2 const map_max(out_w - pad, out_h - pad);
 
-    // 300 deg sweep, empty wedge at the bottom. ImGui PathArcTo uses
-    // screen-space CW angles (0 = +X, pi/2 = down).
-    constexpr float kSpeedoStart = 2.094395f;   // 2*pi/3  -- 7 o'clock
-    constexpr float kSpeedoEnd   = 7.330382f;   // 7*pi/3  -- 5 o'clock
-    constexpr float kSpeedoSweep = kSpeedoEnd - kSpeedoStart;  // 300 deg
-    constexpr float kMaxKph      = 180.0f;
-    constexpr float kRedlineKph  = 150.0f;
+        size_t traversed = 0;
+        for (auto const& e : route) {
+          if (e.gpmf_sample_no > cached_sample_no) break;
+          ++traversed;
+        }
+        size_t const cur_idx = traversed > 0 ? traversed - 1 : 0;
 
-    dl->AddCircleFilled(speedo_center, r_outer, kCFace, 64);
-    dl->AddCircle      (speedo_center, r_outer, kCRimHi, 64, 2.5f);
-    dl->AddCircle      (speedo_center, r_outer - 12.0f, kCRimLo, 64, 1.0f);
+        float const base_w = static_cast<float>(osm_minimap_local->base_map_width());
+        float const base_h = static_cast<float>(osm_minimap_local->base_map_height());
+        float cx = 0.0f;
+        float cy = 0.0f;
+        osm_minimap_local->ProjectGpsToPixel(route[cur_idx].lat, route[cur_idx].lng, cx, cy);
 
-    dl->PathArcTo(speedo_center, r_track, kSpeedoStart, kSpeedoEnd, 64);
-    dl->PathStroke(IM_COL32(45, 55, 70, 220), false, 8.0f);
+        float const vp_x0 = std::clamp(cx - map_size * 0.5f,
+                                       0.0f, std::max(0.0f, base_w - map_size));
+        float const vp_y0 = std::clamp(cy - map_size * 0.5f,
+                                       0.0f, std::max(0.0f, base_h - map_size));
+        float const u0 = vp_x0 / base_w;
+        float const v0 = vp_y0 / base_h;
+        float const u1 = std::min((vp_x0 + map_size) / base_w, 1.0f);
+        float const v1 = std::min((vp_y0 + map_size) / base_h, 1.0f);
 
-    constexpr float kMpsToKph = 3.6f;
-    float kph = 0.0f;
-    bool have_gps = false;
-    if (cached_gpmf != nullptr) {
-      if (auto gps = cached_gpmf->gps9()) {
-        kph = gps->speed_2d * kMpsToKph;
-        have_gps = true;
+        dl->AddImage(static_cast<ImTextureID>(minimap_local_tex.Get()),
+                     map_min, map_max, ImVec2(u0, v0), ImVec2(u1, v1));
+
+        // Route polyline in mosaic pixel space, decimated for very
+        // long captures, offset into the viewport 1:1.
+        dl->PushClipRect(map_min, map_max, true);
+        {
+          constexpr size_t kMaxPolylinePoints = 1500;
+          size_t const stride = std::max<size_t>(1, route.size() / kMaxPolylinePoints);
+          std::vector<ImVec2> pts;
+          pts.reserve(route.size() / stride + 2);
+          int traversed_pts = 0;
+          for (size_t i = 0; i < route.size(); i += stride) {
+            float mx = 0.0f;
+            float my = 0.0f;
+            osm_minimap_local->ProjectGpsToPixel(route[i].lat, route[i].lng, mx, my);
+            pts.push_back(ImVec2(map_min.x + (mx - vp_x0),
+                                 map_min.y + (my - vp_y0)));
+            if (i <= cur_idx) traversed_pts = static_cast<int>(pts.size());
+          }
+          hud::DrawTrackPolyline(dl, pts.data(), static_cast<int>(pts.size()),
+                                 traversed_pts, s);
+        }
+        hud::DrawPositionMarker(
+          dl, ImVec2(map_min.x + (cx - vp_x0), map_min.y + (cy - vp_y0)), s);
+        hud::DrawOsmAttribution(dl, map_min, map_max, s);
+        dl->PopClipRect();
+        hud::DrawMapFrame(dl, map_min, map_max);
       }
-    }
-
-    if (kph > 0.0f) {
-      float const t = std::min(kph / kMaxKph, 1.0f);
-      float const fill_end = kSpeedoStart + t * kSpeedoSweep;
-      bool  const redlined = kph >= kRedlineKph;
-      dl->PathArcTo(speedo_center, r_track, kSpeedoStart, fill_end, 64);
-      dl->PathStroke(redlined ? kCFillHi : kCFill, false, 8.0f);
-    }
-
-    for (int i = 0; i <= 18; ++i) {
-      float const tick_kph = i * 10.0f;
-      float const angle    = kSpeedoStart + (tick_kph / kMaxKph) * kSpeedoSweep;
-      float const cos_a    = std::cos(angle);
-      float const sin_a    = std::sin(angle);
-      bool  const major    = (i % 2) == 0;
-      float const tick_len = major ? 11.0f : 6.0f;
-      ImVec2 const p_outer(speedo_center.x + r_rim * cos_a,
-                           speedo_center.y + r_rim * sin_a);
-      ImVec2 const p_inner(speedo_center.x + (r_rim - tick_len) * cos_a,
-                           speedo_center.y + (r_rim - tick_len) * sin_a);
-      dl->AddLine(p_inner, p_outer,
-                  major ? kCWhite : IM_COL32(140, 150, 160, 200),
-                  major ? 1.8f : 1.0f);
-      if (major) {
-        char lbl[8];
-        std::snprintf(lbl, sizeof(lbl), "%d", static_cast<int>(tick_kph));
-        ImVec2 const sz = font->CalcTextSizeA(font_h, FLT_MAX, 0.0f, lbl);
-        ImVec2 const lp(speedo_center.x + (r_rim - tick_len - 12.0f) * cos_a - sz.x * 0.5f,
-                        speedo_center.y + (r_rim - tick_len - 12.0f) * sin_a - sz.y * 0.5f);
-        dl->AddText(lp, kCDim, lbl);
-      }
-    }
-
-    int const kph_int = std::clamp(static_cast<int>(kph + 0.5f), 0, 999);
-    char digits[4]{};
-    std::snprintf(digits, sizeof(digits), "%3d", kph_int);
-
-    float const digit_w   = r_outer * 0.30f;
-    float const digit_h   = r_outer * 0.55f;
-    float const digit_gap = digit_w * 0.20f;
-    int const num_digits  = 3;
-    float const total_w   = num_digits * digit_w + (num_digits - 1) * digit_gap;
-    float const digits_y  = speedo_center.y - digit_h * 0.5f - r_outer * 0.05f;
-    float const digits_x0 = speedo_center.x - total_w * 0.5f;
-
-    ImU32 const seg_off = IM_COL32(255, 255, 255, 24);
-    for (int i = 0; i < num_digits; ++i) {
-      ImVec2 const dp(digits_x0 + i * (digit_w + digit_gap), digits_y);
-      if (digits[i] == ' ') {
-        DrawSevenSeg(dl, dp, digit_w, digit_h, 8, seg_off, seg_off);
-      } else {
-        DrawSevenSeg(dl, dp, digit_w, digit_h, digits[i] - '0', kCWhite, seg_off);
-      }
-    }
-
-    char const* unit = "km/h";
-    float const unit_h  = font_h * 1.2f;
-    ImVec2 const unit_sz = font->CalcTextSizeA(unit_h, FLT_MAX, 0.0f, unit);
-    dl->AddText(font, unit_h,
-                ImVec2(speedo_center.x - unit_sz.x * 0.5f,
-                       digits_y + digit_h + 6.0f),
-                kCDim, unit);
-
-    dl->AddCircleFilled(speedo_center, 5.0f, kCRimHi, 16);
-
-    // ---- Left panel: GPS readouts ----
-    float const left_x = 16.0f;
-    float       left_y = 28.0f;
-    dl->AddText(ImVec2(left_x, left_y), kCDim, "GPS"); left_y += line_h;
-    if (have_gps && cached_gpmf != nullptr) {
-      auto gps = cached_gpmf->gps9();
-      std::snprintf(buf, sizeof(buf), "%9.5f", gps->latitude);
-      dl->AddText(ImVec2(left_x, left_y), kCWhite, buf); left_y += line_h;
-      std::snprintf(buf, sizeof(buf), "%9.5f", gps->longitude);
-      dl->AddText(ImVec2(left_x, left_y), kCWhite, buf); left_y += line_h;
-      std::snprintf(buf, sizeof(buf), "alt %.1f m", gps->altitude);
-      dl->AddText(ImVec2(left_x, left_y), kCDim, buf); left_y += line_h;
-      std::snprintf(buf, sizeof(buf), "fix %u  DOP %.2f", gps->fix, gps->dop);
-      dl->AddText(ImVec2(left_x, left_y), kCDim, buf); left_y += line_h;
-      std::snprintf(buf, sizeof(buf), "3D %.2f m/s", gps->speed_3d);
-      dl->AddText(ImVec2(left_x, left_y), kCDim, buf);
-    } else {
-      dl->AddText(ImVec2(left_x, left_y), kCDim, "-- no fix --");
-    }
-
-    // ---- Right panel: OSM dual map (overview + local detail) ----
-    float const right_size = ov_size.y - 32.0f;
-    float const right_x0   = visible_w - right_size - 16.0f;
-    float const right_y0   = 16.0f;
-    float const overview_h = right_size * 0.40f;
-    ImVec2 const ov_panel_min(right_x0,              right_y0);
-    ImVec2 const ov_panel_max(right_x0 + right_size, right_y0 + overview_h);
-    ImVec2 const lo_panel_min(right_x0,              right_y0 + overview_h + 4.0f);
-    ImVec2 const lo_panel_max(right_x0 + right_size, right_y0 + right_size);
-
-    ImU32 const kCRouteAll  = IM_COL32( 40, 110, 230, 180);
-    ImU32 const kCRouteDone = IM_COL32(255, 110, 110, 240);
-
-    // Where in `route` does the currently-displayed frame sit?
-    size_t traversed = 0;
-    for (auto const& e : route) {
-      if (e.gpmf_sample_no > cached_sample_no) break;
-      ++traversed;
-    }
-
-    auto draw_no_map_placeholder = [&](ImVec2 p_min, ImVec2 p_max) {
-      dl->AddRectFilled(p_min, p_max, IM_COL32(25, 30, 40, 220), 4.0f);
-      dl->AddRect(p_min, p_max, kCRimLo, 4.0f, 0, 1.5f);
-      char const* msg = "-- no map --";
-      ImVec2 const sz = font->CalcTextSizeA(font_h, FLT_MAX, 0.0f, msg);
-      dl->AddText(ImVec2(p_min.x + ((p_max.x - p_min.x) - sz.x) * 0.5f,
-                         p_min.y + ((p_max.y - p_min.y) - sz.y) * 0.5f),
-                  kCDim, msg);
-    };
-
-    // Overview (top): whole route, uniform-scale letterboxed.
-    if (osm_minimap != nullptr && minimap_tex.IsValid()) {
-      float const panel_w = ov_panel_max.x - ov_panel_min.x;
-      float const panel_h = ov_panel_max.y - ov_panel_min.y;
-      float const base_w  = static_cast<float>(osm_minimap->base_map_width());
-      float const base_h  = static_cast<float>(osm_minimap->base_map_height());
-      float const scale   = std::min(panel_w / base_w, panel_h / base_h);
-      float const draw_w  = base_w * scale;
-      float const draw_h  = base_h * scale;
-      float const draw_x0 = ov_panel_min.x + (panel_w - draw_w) * 0.5f;
-      float const draw_y0 = ov_panel_min.y + (panel_h - draw_h) * 0.5f;
-      ImVec2 const draw_min(draw_x0, draw_y0);
-      ImVec2 const draw_max(draw_x0 + draw_w, draw_y0 + draw_h);
-
-      dl->AddRectFilled(ov_panel_min, ov_panel_max, IM_COL32(15, 20, 30, 240), 4.0f);
-      dl->AddImage(static_cast<ImTextureID>(minimap_tex.Get()),
-                   draw_min, draw_max);
-      dl->AddRect(ov_panel_min, ov_panel_max, kCRimHi, 4.0f, 0, 1.0f);
-
-      std::vector<ImVec2> pts;
-      pts.reserve(route.size());
-      for (auto const& e : route) {
-        float bx = 0.0f;
-        float by = 0.0f;
-        osm_minimap->ProjectGpsToPixel(e.lat, e.lng, bx, by);
-        pts.push_back(ImVec2(draw_min.x + bx * scale,
-                             draw_min.y + by * scale));
-      }
-      dl->PushClipRect(ov_panel_min, ov_panel_max, true);
-      if (pts.size() >= 2) {
-        dl->AddPolyline(pts.data(), static_cast<int>(pts.size()),
-                        kCRouteAll, 0, 1.5f);
-      }
-      if (traversed >= 2) {
-        dl->AddPolyline(pts.data(), static_cast<int>(traversed),
-                        kCRouteDone, 0, 2.0f);
-      }
-      if (traversed > 0) {
-        ImVec2 const p = pts[traversed - 1];
-        dl->AddCircleFilled(p, 4.0f, kCWhite,                12);
-        dl->AddCircle      (p, 4.0f, IM_COL32(0, 0, 0, 220), 12, 1.0f);
-      }
-      dl->PopClipRect();
-    } else {
-      draw_no_map_placeholder(ov_panel_min, ov_panel_max);
-    }
-
-    // Local (bottom): viewport centred on the current fix.
-    if (osm_minimap_local != nullptr && minimap_local_tex.IsValid() && !route.empty()) {
-      float const panel_w = lo_panel_max.x - lo_panel_min.x;
-      float const panel_h = lo_panel_max.y - lo_panel_min.y;
-      float const base_w  = static_cast<float>(osm_minimap_local->base_map_width());
-      float const base_h  = static_cast<float>(osm_minimap_local->base_map_height());
-
-      size_t const cur_idx = traversed > 0 ? traversed - 1 : 0;
-      RouteEntry const& cur = route[cur_idx];
-
-      float cx = 0.0f;
-      float cy = 0.0f;
-      osm_minimap_local->ProjectGpsToPixel(cur.lat, cur.lng, cx, cy);
-
-      float const vp_w = 384.0f;
-      float const vp_h = vp_w * (panel_h / panel_w);
-      float vp_x0 = std::clamp(cx - vp_w * 0.5f,
-                               0.0f, std::max(0.0f, base_w - vp_w));
-      float vp_y0 = std::clamp(cy - vp_h * 0.5f,
-                               0.0f, std::max(0.0f, base_h - vp_h));
-      float const u0 = vp_x0 / base_w;
-      float const v0 = vp_y0 / base_h;
-      float const u1 = std::min((vp_x0 + vp_w) / base_w, 1.0f);
-      float const v1 = std::min((vp_y0 + vp_h) / base_h, 1.0f);
-
-      dl->AddRectFilled(lo_panel_min, lo_panel_max, IM_COL32(15, 20, 30, 240), 4.0f);
-      dl->AddImage(static_cast<ImTextureID>(minimap_local_tex.Get()),
-                   lo_panel_min, lo_panel_max,
-                   ImVec2(u0, v0), ImVec2(u1, v1));
-      dl->AddRect(lo_panel_min, lo_panel_max, kCRimHi, 4.0f, 0, 1.0f);
-
-      float const sx = panel_w / vp_w;
-      float const sy = panel_h / vp_h;
-      std::vector<ImVec2> lpts;
-      lpts.reserve(route.size());
-      for (auto const& e : route) {
-        float mx = 0.0f;
-        float my = 0.0f;
-        osm_minimap_local->ProjectGpsToPixel(e.lat, e.lng, mx, my);
-        lpts.push_back(ImVec2(lo_panel_min.x + (mx - vp_x0) * sx,
-                              lo_panel_min.y + (my - vp_y0) * sy));
-      }
-      dl->PushClipRect(lo_panel_min, lo_panel_max, true);
-      if (lpts.size() >= 2) {
-        dl->AddPolyline(lpts.data(), static_cast<int>(lpts.size()),
-                        kCRouteAll, 0, 2.0f);
-      }
-      if (traversed >= 2) {
-        dl->AddPolyline(lpts.data(), static_cast<int>(traversed),
-                        kCRouteDone, 0, 3.0f);
-      }
-      if (traversed > 0) {
-        ImVec2 const p = lpts[traversed - 1];
-        dl->AddCircleFilled(p, 7.0f, kCWhite,                16);
-        dl->AddCircle      (p, 7.0f, IM_COL32(0, 0, 0, 220), 16, 1.5f);
-      }
-      dl->PopClipRect();
-    } else {
-      draw_no_map_placeholder(lo_panel_min, lo_panel_max);
     }
 
     dl->PopTextureID();
@@ -1103,8 +834,8 @@ struct TranscodeSession::Impl final {
     ImDrawData dd;
     dd.Clear();
     dd.DisplayPos       = ImVec2(0.0f, 0.0f);
-    dd.DisplaySize      = ImVec2(static_cast<float>(kOverlayWidth),
-                                 static_cast<float>(kOverlayHeight));
+    dd.DisplaySize      = ImVec2(static_cast<float>(encode_width),
+                                 static_cast<float>(encode_height));
     dd.FramebufferScale = ImVec2(1.0f, 1.0f);
     dd.AddDrawList(overlay_drawlist);
     dd.Valid = true;
