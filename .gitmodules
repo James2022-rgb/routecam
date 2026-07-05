@@ -1,0 +1,53 @@
+[submodule "mbase"]
+	path = mbase
+	url = https://github.com/James2022-rgb/mbase
+[submodule "mmath"]
+	path = mmath
+	url = https://github.com/James2022-rgb/mmath
+[submodule "masset"]
+	path = masset
+	url = https://github.com/James2022-rgb/masset
+[submodule "mimage"]
+	path = mimage
+	url = https://github.com/James2022-rgb/mimage
+[submodule "maudio"]
+	path = maudio
+	url = https://github.com/James2022-rgb/maudio
+[submodule "mdemux"]
+	path = mdemux
+	url = https://github.com/James2022-rgb/mdemux
+[submodule "maacdec"]
+	path = maacdec
+	url = https://github.com/James2022-rgb/maacdec
+[submodule "mhevcdec"]
+	path = mhevcdec
+	url = https://github.com/James2022-rgb/mhevcdec
+[submodule "mplay"]
+	path = mplay
+	url = https://github.com/James2022-rgb/mplay
+[submodule "mhevcenc"]
+	path = mhevcenc
+	url = https://github.com/James2022-rgb/mhevcenc
+[submodule "mmux"]
+	path = mmux
+	url = https://github.com/James2022-rgb/mmux.git
+[submodule "mgpmf"]
+	path = mgpmf
+	url = https://github.com/James2022-rgb/mgpmf.git
+[submodule "mslang"]
+	path = mslang
+	url = https://github.com/James2022-rgb/mslang
+[submodule "mslang-proxy"]
+	path = mslang-proxy
+	url = https://github.com/James2022-rgb/mslang-proxy.git
+[submodule "mnexus"]
+	path = mnexus
+	url = https://github.com/James2022-rgb/mnexus
+	branch = feature/video
+[submodule "mshell"]
+	path = mshell
+	url = https://github.com/James2022-rgb/mshell
+	branch = main
+[submodule "thirdparty/SDL"]
+	path = thirdparty/SDL
+	url = https://github.com/libsdl-org/SDL

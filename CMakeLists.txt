@@ -3,15 +3,16 @@
 # (GoPro HERO / Max 2) video files with GPS + IMU telemetry.
 #
 # Top-level CMake project that produces `routecam.exe`. Brings up its
-# own SDL2 + Vulkan main loop on `mshell`, hosts a
-# `routecam::RouteCamFrame` (= `mshell::IFrame`). Does NOT depend on
-# `wentos-app2` -- this directory tree is structured so it can move
-# to its own repo with mbase / mnexus / mplay / mshell / etc. pulled
-# in as submodules.
+# own SDL2 + Vulkan main loop on `mshell` and hosts a
+# `routecam::RouteCamFrame` (= `mshell::IFrame`). All library
+# dependencies are git submodules at the repo root (m-libs) and
+# under `thirdparty/` (SDL).
 #
-# Build:
-#   cmake -S routecam -B routecam/build-win_x64
-#   cmake --build routecam/build-win_x64 --target routecam --config Debug
+# Build (from the repo root):
+#   cmake -S . -B build-win_x64
+#   cmake --build build-win_x64 --target routecam --config Debug
+#
+# Run from the repo root -- assets resolve as `<cwd>/assets/...`.
 #
 
 CMAKE_MINIMUM_REQUIRED(VERSION 3.22)
@@ -28,23 +29,22 @@ project(${TARGET_NAME}
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
-# ----- Sibling libs -----
+# ----- Submodule libs -----
 # Order matters; downstream libs assert that their deps already exist.
 
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mbase  ${CMAKE_CURRENT_BINARY_DIR}/mbase)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mmath  ${CMAKE_CURRENT_BINARY_DIR}/mmath)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../masset ${CMAKE_CURRENT_BINARY_DIR}/masset)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mimage ${CMAKE_CURRENT_BINARY_DIR}/mimage)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mbase  ${CMAKE_CURRENT_BINARY_DIR}/mbase)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mmath  ${CMAKE_CURRENT_BINARY_DIR}/mmath)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/masset ${CMAKE_CURRENT_BINARY_DIR}/masset)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mimage ${CMAKE_CURRENT_BINARY_DIR}/mimage)
 
 # SDL2-static -- needed by mshell (ImGui SDL2 backend) and by this
-# app's main loop. Source lives under app/thirdparty for now (will
-# move to a top-level thirdparty/ once routecam is split off into
-# its own repo).
+# app's main loop. `thirdparty/SDL` is pinned to the release-2.30.2
+# tag (the SDL2 series).
 if(NOT TARGET SDL2-static AND NOT ANDROID AND NOT EMSCRIPTEN)
   set(SDL2_DISABLE_SDL2MAIN ON)
   set(SDL2_DISABLE_UNINSTALL ON)
   set(SDL_STATIC ON CACHE BOOL "" FORCE)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../app/thirdparty/SDL2-2.30.2 ${CMAKE_CURRENT_BINARY_DIR}/SDL2-2.30.2)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/SDL ${CMAKE_CURRENT_BINARY_DIR}/SDL)
   foreach(t sdl_headers_copy SDL2-static)
     if(TARGET ${t})
       set_target_properties(${t} PROPERTIES FOLDER "external/SDL2")
@@ -59,28 +59,29 @@ endif()
 # routecam (via mshell) hard-selects the Vulkan backend. Disable the
 # WebGPU/Dawn backend so the build does not pull in Dawn and its ~78
 # recursive submodules -- a large chunk of configure + build time we
-# gain nothing from here.
+# gain nothing from here. (Do NOT `submodule update --recursive`
+# into mnexus for the same reason; see CLAUDE.md.)
 set(MNEXUS_ENABLE_BACKEND_WGPU OFF CACHE BOOL "" FORCE)
 set(MNEXUS_ENABLE_DAWN         OFF CACHE BOOL "" FORCE)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mnexus       ${CMAKE_CURRENT_BINARY_DIR}/mnexus)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mslang       ${CMAKE_CURRENT_BINARY_DIR}/mslang)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mslang-proxy ${CMAKE_CURRENT_BINARY_DIR}/mslang-proxy)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mnexus       ${CMAKE_CURRENT_BINARY_DIR}/mnexus)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mslang       ${CMAKE_CURRENT_BINARY_DIR}/mslang)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mslang-proxy ${CMAKE_CURRENT_BINARY_DIR}/mslang-proxy)
 
 # Media stack used by RouteCamFrame.
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../maudio   ${CMAKE_CURRENT_BINARY_DIR}/maudio)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mdemux   ${CMAKE_CURRENT_BINARY_DIR}/mdemux)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mgpmf    ${CMAKE_CURRENT_BINARY_DIR}/mgpmf)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../maacdec  ${CMAKE_CURRENT_BINARY_DIR}/maacdec)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/maudio   ${CMAKE_CURRENT_BINARY_DIR}/maudio)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mdemux   ${CMAKE_CURRENT_BINARY_DIR}/mdemux)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mgpmf    ${CMAKE_CURRENT_BINARY_DIR}/mgpmf)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/maacdec  ${CMAKE_CURRENT_BINARY_DIR}/maacdec)
 if(WIN32)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mhevcdec ${CMAKE_CURRENT_BINARY_DIR}/mhevcdec)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mplay    ${CMAKE_CURRENT_BINARY_DIR}/mplay)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mhevcdec ${CMAKE_CURRENT_BINARY_DIR}/mhevcdec)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mplay    ${CMAKE_CURRENT_BINARY_DIR}/mplay)
   # Burn-in transcode stack (Vulkan Video encode + MP4 mux).
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mhevcenc ${CMAKE_CURRENT_BINARY_DIR}/mhevcenc)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mmux     ${CMAKE_CURRENT_BINARY_DIR}/mmux)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mhevcenc ${CMAKE_CURRENT_BINARY_DIR}/mhevcenc)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mmux     ${CMAKE_CURRENT_BINARY_DIR}/mmux)
 endif()
 
 # mshell (window + mnexus + ImGui + per-frame IFrame lifecycle).
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mshell ${CMAKE_CURRENT_BINARY_DIR}/mshell)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mshell ${CMAKE_CURRENT_BINARY_DIR}/mshell)
 
 # ----- routecam.exe -----
 
@@ -110,7 +111,7 @@ add_executable(${TARGET_NAME})
 target_compile_features(${TARGET_NAME} PRIVATE cxx_std_23)
 
 set_target_properties(${TARGET_NAME} PROPERTIES
-  VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.."
+  VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 
 target_sources(${TARGET_NAME} PRIVATE ${SOURCES})
