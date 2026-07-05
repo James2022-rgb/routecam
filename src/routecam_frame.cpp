@@ -29,6 +29,7 @@
 #include "gps_timeline.h"
 #include "minimap.h"
 #include "osm_tile_cache.h"
+#include "transcode_session.h"
 
 namespace routecam {
 
@@ -38,6 +39,27 @@ namespace {
 // match what the playground prototype used so cold-start runs the
 // developer's normal test capture.
 constexpr char const* kFallbackPath = R"(J:\Pics\旅行\GX010005.MP4)";
+
+// "path/name.MP4" -> "path/name_overlay.mp4".
+std::string DeriveOverlayOutputPath(std::string const& input_path) {
+  size_t const dot = input_path.find_last_of('.');
+  std::string const stem = (dot != std::string::npos)
+    ? input_path.substr(0, dot) : input_path;
+  return stem + "_overlay.mp4";
+}
+
+void FormatDuration(double secs, char* out, size_t out_capacity) {
+  if (secs < 0.0) secs = 0.0;
+  uint32_t const total = static_cast<uint32_t>(secs + 0.5);
+  uint32_t const h = total / 3600u;
+  uint32_t const m = (total % 3600u) / 60u;
+  uint32_t const s = total % 60u;
+  if (h > 0) {
+    std::snprintf(out, out_capacity, "%u:%02u:%02u", h, m, s);
+  } else {
+    std::snprintf(out, out_capacity, "%u:%02u", m, s);
+  }
+}
 
 } // namespace
 
@@ -52,6 +74,12 @@ struct RouteCamFrame::Impl final {
   std::unique_ptr<OsmTileCache>       tile_cache;
   int                                 minimap_zoom = 15;
   bool                                show_minimap = true;
+
+  // Burn-in transcode. While a session exists the playback player is
+  // torn down (NVDEC session limits) and the transport UI is hidden.
+  std::unique_ptr<TranscodeSession>   transcode;
+  uint32_t                            transcode_scale = 1;
+  std::string                         tile_cache_dir;
 
   mnexus::ShaderModuleHandle vs_handle      = {};
   mnexus::ShaderModuleHandle fs_handle      = {};
@@ -126,10 +154,10 @@ void RouteCamFrame::OnAttach(mshell::AttachContext const& ctx) {
   // the user's local app data (falls back to the working dir).
   {
     char const* const local_app_data = std::getenv("LOCALAPPDATA");
-    std::string const cache_dir = (local_app_data != nullptr)
+    impl_->tile_cache_dir = (local_app_data != nullptr)
       ? std::string(local_app_data) + "\\RouteCam\\tiles"
       : std::string("tile_cache");
-    impl_->tile_cache = OsmTileCache::Create(impl_->device, cache_dir);
+    impl_->tile_cache = OsmTileCache::Create(impl_->device, impl_->tile_cache_dir);
   }
 
   if (!LoadFile(impl_->mp4_path)) {
@@ -139,6 +167,7 @@ void RouteCamFrame::OnAttach(mshell::AttachContext const& ctx) {
 
 void RouteCamFrame::OnDetach() {
   MBASE_LOG_INFO("RouteCamFrame::OnDetach");
+  impl_->transcode.reset();   // drains in-flight encode work
   impl_->tile_cache.reset();  // joins the fetch worker, frees tile textures
   if (impl_->device != nullptr) {
     if (impl_->ubo_handle.IsValid())     impl_->device->DestroyBuffer(impl_->ubo_handle);
@@ -164,6 +193,10 @@ void RouteCamFrame::OnEvent(mshell::PlatformEvent const& event) {
 }
 
 bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
+  if (impl_->transcode != nullptr) {
+    MBASE_LOG_WARN("RouteCamFrame::LoadFile: ignored -- transcode in progress");
+    return false;
+  }
   std::string const path = mp4_path.empty() ? std::string{kFallbackPath} : mp4_path;
   MBASE_LOG_INFO("RouteCamFrame::LoadFile: opening {}", path);
 
@@ -254,7 +287,62 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
     ImGui::TextDisabled("%s", impl_->mp4_path.c_str());
     ImGui::Separator();
 
-    if (impl_->player == nullptr) {
+    if (impl_->transcode != nullptr) {
+      // ----- Transcode in progress / finished ------------
+      TranscodeSession& ts = *impl_->transcode;
+      if (ts.state() == TranscodeSession::State::kTranscoding) {
+        float const progress = ts.total_frames() > 0u
+          ? static_cast<float>(ts.next_frame()) / static_cast<float>(ts.total_frames())
+          : 0.0f;
+        ImGui::ProgressBar(progress);
+        ImGui::Text("Frame %u / %u  (%u IDR + %u P)  ->  %ux%u",
+          ts.next_frame(), ts.total_frames(),
+          ts.encoded_irap_count(), ts.encoded_p_count(),
+          ts.encode_width(), ts.encode_height());
+
+        double const elapsed = ts.elapsed_seconds();
+        if (ts.next_frame() > 0u && elapsed > 0.001) {
+          double const src_dur   = ts.source_duration_seconds();
+          double const done_frac = ts.total_frames() > 0u
+            ? static_cast<double>(ts.next_frame()) / static_cast<double>(ts.total_frames())
+            : 0.0;
+          double const encoded_secs = src_dur * done_frac;
+          double const speed        = encoded_secs / elapsed;
+          double const eta          = (speed > 1e-6)
+            ? (src_dur - encoded_secs) / speed : 0.0;
+          char buf_elapsed[32]; FormatDuration(elapsed, buf_elapsed, sizeof(buf_elapsed));
+          char buf_eta[32];     FormatDuration(eta,     buf_eta,     sizeof(buf_eta));
+          ImGui::Text("Speed: %.2fx realtime   elapsed %s   ETA ~%s",
+                      speed, buf_elapsed, buf_eta);
+        }
+        ImGui::Text("Encoded bytes: %llu",
+                    static_cast<unsigned long long>(ts.encoded_bytes()));
+        auto const st = ts.stage_averages();
+        ImGui::TextDisabled("Stage avg ms: decode %.2f  gfx %.2f  wait %.2f  submit %.2f  mux %.2f",
+                            st.decode_ms, st.gfx_ms, st.wait_ms, st.submit_ms, st.mux_ms);
+        if (ImGui::Button("Cancel")) {
+          ts.Cancel();
+        }
+      } else if (ts.state() == TranscodeSession::State::kDone) {
+        ImGui::TextColored(ImVec4(0.4f, 0.95f, 0.4f, 1.0f),
+          "Done -- %u frames (%llu bytes) in %.0fs:",
+          ts.next_frame(),
+          static_cast<unsigned long long>(ts.encoded_bytes()),
+          ts.elapsed_seconds());
+        ImGui::TextWrapped("%s", ts.output_path().c_str());
+        if (ImGui::Button("Close")) {
+          impl_->transcode.reset();
+          LoadFile(impl_->mp4_path);  // restore playback
+        }
+      } else {  // kError
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+          "Aborted at frame %u: %s", ts.next_frame(), ts.last_error().c_str());
+        if (ImGui::Button("Close")) {
+          impl_->transcode.reset();
+          LoadFile(impl_->mp4_path);  // restore playback
+        }
+      }
+    } else if (impl_->player == nullptr) {
       ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
                          "No file open. Use File > Open... or drop a file here.");
     } else {
@@ -322,6 +410,45 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
           impl_->player->SeekToDisplayIndex(static_cast<uint32_t>(slider_value));
         }
       }
+
+      // ----- Burn-in transcode launcher -----------------
+      ImGui::Separator();
+      if (ImGui::CollapsingHeader("Transcode (burn-in overlay)")) {
+        if (info.bit_depth != 8) {
+          ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+            "%u-bit source -- only 8-bit (SDR) can be transcoded for now.",
+            info.bit_depth);
+        } else {
+          static char const* const kScaleLabels[] = { "1x (native)", "1/2x (half)", "1/4x (quarter)" };
+          static uint32_t   const  kScaleValues[] = { 1u, 2u, 4u };
+          int scale_idx = 0;
+          for (int i = 0; i < 3; ++i) {
+            if (kScaleValues[i] == impl_->transcode_scale) { scale_idx = i; break; }
+          }
+          if (ImGui::Combo("Encode scale", &scale_idx, kScaleLabels, IM_ARRAYSIZE(kScaleLabels))) {
+            impl_->transcode_scale = kScaleValues[scale_idx];
+          }
+          std::string const output_path = DeriveOverlayOutputPath(impl_->mp4_path);
+          ImGui::TextDisabled("Output: %s", output_path.c_str());
+
+          if (ImGui::Button("Start Transcode")) {
+            std::string const input_path = impl_->mp4_path;
+            // Free the playback decode session before the transcode
+            // opens its own (NVDEC session limits).
+            impl_->player.reset();
+            impl_->transcode = TranscodeSession::Start(impl_->device, TranscodeDesc{
+              .input_path    = input_path,
+              .output_path   = output_path,
+              .map_cache_dir = impl_->tile_cache_dir,
+              .encode_scale  = impl_->transcode_scale,
+            });
+            if (impl_->transcode == nullptr) {
+              MBASE_LOG_WARN("RouteCamFrame: TranscodeSession::Start failed; restoring playback");
+              LoadFile(input_path);
+            }
+          }
+        }
+      }
     }
   }
   ImGui::End();
@@ -366,6 +493,14 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
 }
 
 void RouteCamFrame::OnRender(mshell::RenderContext const& ctx) {
+  // Advance the burn-in transcode one frame per app frame. The
+  // playback player is torn down while a session exists, so the
+  // null-player clear below keeps the swapchain valid.
+  if (impl_->transcode != nullptr &&
+      impl_->transcode->state() == TranscodeSession::State::kTranscoding) {
+    impl_->transcode->Tick();
+  }
+
   if (impl_->player == nullptr) {
     // Clear so the previous frame doesn't ghost.
     ctx.command_list->TextureBarrier(

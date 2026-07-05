@@ -74,6 +74,9 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../maacdec  ${CMAKE_CURRENT_BINARY_
 if(WIN32)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mhevcdec ${CMAKE_CURRENT_BINARY_DIR}/mhevcdec)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mplay    ${CMAKE_CURRENT_BINARY_DIR}/mplay)
+  # Burn-in transcode stack (Vulkan Video encode + MP4 mux).
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mhevcenc ${CMAKE_CURRENT_BINARY_DIR}/mhevcenc)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mmux     ${CMAKE_CURRENT_BINARY_DIR}/mmux)
 endif()
 
 # mshell (window + mnexus + ImGui + per-frame IFrame lifecycle).
@@ -88,11 +91,15 @@ set(SOURCES
   ${SOURCE_DIR}/main.cpp
   ${SOURCE_DIR}/minimap.cpp
   ${SOURCE_DIR}/minimap.h
+  ${SOURCE_DIR}/osm_minimap.cpp
+  ${SOURCE_DIR}/osm_minimap.h
   ${SOURCE_DIR}/osm_tile_cache.cpp
   ${SOURCE_DIR}/osm_tile_cache.h
   ${SOURCE_DIR}/routecam_frame.h
   ${SOURCE_DIR}/routecam_frame.cpp
   ${SOURCE_DIR}/slippy_map.h
+  ${SOURCE_DIR}/transcode_session.cpp
+  ${SOURCE_DIR}/transcode_session.h
 )
 
 add_executable(${TARGET_NAME})
@@ -107,7 +114,9 @@ target_sources(${TARGET_NAME} PRIVATE ${SOURCES})
 target_link_libraries(${TARGET_NAME} PRIVATE
   mbase
   mgpmf
+  mhevcenc
   mimage
+  mmux
   mshell
   mplay
 )
