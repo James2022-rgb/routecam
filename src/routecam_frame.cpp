@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <vector>
 
@@ -26,6 +27,8 @@
 
 // project headers ---------------------------------------
 #include "gps_timeline.h"
+#include "minimap.h"
+#include "osm_tile_cache.h"
 
 namespace routecam {
 
@@ -46,6 +49,9 @@ struct RouteCamFrame::Impl final {
 
   std::unique_ptr<mplay::MediaPlayer> player;
   std::unique_ptr<GpsTimeline>        gps_timeline;  // null when the file has no GPS
+  std::unique_ptr<OsmTileCache>       tile_cache;
+  int                                 minimap_zoom = 15;
+  bool                                show_minimap = true;
 
   mnexus::ShaderModuleHandle vs_handle      = {};
   mnexus::ShaderModuleHandle fs_handle      = {};
@@ -116,6 +122,16 @@ void RouteCamFrame::OnAttach(mshell::AttachContext const& ctx) {
     .size_in_bytes = 80,
   });
 
+  // OSM tile cache for the minimap. Persistent across sessions in
+  // the user's local app data (falls back to the working dir).
+  {
+    char const* const local_app_data = std::getenv("LOCALAPPDATA");
+    std::string const cache_dir = (local_app_data != nullptr)
+      ? std::string(local_app_data) + "\\RouteCam\\tiles"
+      : std::string("tile_cache");
+    impl_->tile_cache = OsmTileCache::Create(impl_->device, cache_dir);
+  }
+
   if (!LoadFile(impl_->mp4_path)) {
     MBASE_LOG_WARN("RouteCamFrame::OnAttach: initial LoadFile({}) failed", impl_->mp4_path);
   }
@@ -123,6 +139,7 @@ void RouteCamFrame::OnAttach(mshell::AttachContext const& ctx) {
 
 void RouteCamFrame::OnDetach() {
   MBASE_LOG_INFO("RouteCamFrame::OnDetach");
+  impl_->tile_cache.reset();  // joins the fetch worker, frees tile textures
   if (impl_->device != nullptr) {
     if (impl_->ubo_handle.IsValid())     impl_->device->DestroyBuffer(impl_->ubo_handle);
     if (impl_->sampler_handle.IsValid()) impl_->device->DestroySampler(impl_->sampler_handle);
@@ -197,6 +214,9 @@ bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
 }
 
 void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
+  // Turn finished async tile fetches into textures.
+  if (impl_->tile_cache != nullptr) impl_->tile_cache->Update();
+
   // ----- Main menu bar (File > Open) + Ctrl+O hotkey ----
   bool want_open_dialog = false;
   if (ImGui::BeginMainMenuBar()) {
@@ -247,6 +267,8 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
                   impl_->player->current_pts_seconds(), info.total_seconds);
       if (impl_->gps_timeline != nullptr) {
         ImGui::Text("GPS: %zu fixes", impl_->gps_timeline->points().size());
+        ImGui::SameLine();
+        ImGui::Checkbox("Minimap", &impl_->show_minimap);
       } else {
         ImGui::TextDisabled("GPS: none");
       }
@@ -333,6 +355,12 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
                             fix->dop);
       }
       ImGui::End();
+
+      // ----- Minimap (bottom-right corner overlay) ------
+      if (impl_->show_minimap && impl_->tile_cache != nullptr) {
+        DrawMinimap(*impl_->tile_cache, *impl_->gps_timeline, *fix,
+                    impl_->minimap_zoom);
+      }
     }
   }
 }

@@ -86,8 +86,13 @@ set(SOURCES
   ${SOURCE_DIR}/gps_timeline.cpp
   ${SOURCE_DIR}/gps_timeline.h
   ${SOURCE_DIR}/main.cpp
+  ${SOURCE_DIR}/minimap.cpp
+  ${SOURCE_DIR}/minimap.h
+  ${SOURCE_DIR}/osm_tile_cache.cpp
+  ${SOURCE_DIR}/osm_tile_cache.h
   ${SOURCE_DIR}/routecam_frame.h
   ${SOURCE_DIR}/routecam_frame.cpp
+  ${SOURCE_DIR}/slippy_map.h
 )
 
 add_executable(${TARGET_NAME})
@@ -102,9 +107,15 @@ target_sources(${TARGET_NAME} PRIVATE ${SOURCES})
 target_link_libraries(${TARGET_NAME} PRIVATE
   mbase
   mgpmf
+  mimage
   mshell
   mplay
 )
+
+if(WIN32)
+  # WinHTTP for the OSM tile fetcher.
+  target_link_libraries(${TARGET_NAME} PRIVATE winhttp)
+endif()
 
 if(WIN32)
   GET_PROPERTY(mslang_dependent_dll_files GLOBAL PROPERTY MSLANG_DEPENDENT_DLL_FILES_PROPERTY)
