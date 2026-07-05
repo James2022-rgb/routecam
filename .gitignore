@@ -1,2 +1,5 @@
-
 build-win_x64/
+build/
+log/
+imgui.ini
+*.log

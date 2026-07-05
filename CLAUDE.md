@@ -80,6 +80,7 @@ Initialize instead:
 ```
 git submodule update --init                 # top level
 git -C mbase  submodule update --init --recursive
+git -C mimage submodule update --init --recursive
 git -C maudio submodule update --init --recursive
 git -C mnexus submodule update --init thirdparty/SPIRV-Reflect thirdparty/VulkanMemoryAllocator
 git -C mslang submodule update --init thirdparty/slang

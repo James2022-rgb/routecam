@@ -1,0 +1,70 @@
+# Windows build + tagged release.
+#
+# - push / PR: verifies a Release build of routecam.exe.
+# - tag `v*`: additionally packages routecam-<tag>-win-x64.zip
+#   (exe + runtime DLLs + assets) and attaches it to a GitHub
+#   Release.
+#
+# Submodule note: do NOT use `submodules: recursive` -- the mnexus
+# submodule contains Dawn (~78 recursive submodules, some behind
+# Google-internal hosts) which this app builds WITHOUT (the
+# WebGPU/Dawn backend is disabled). Nested submodules are
+# initialized selectively below, mirroring CLAUDE.md.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true  # top level only; see note above
+
+      - name: Init nested submodules (Dawn excluded)
+        shell: bash
+        run: |
+          git -C mbase  submodule update --init --recursive
+          git -C mimage submodule update --init --recursive
+          git -C maudio submodule update --init --recursive
+          git -C mnexus submodule update --init thirdparty/SPIRV-Reflect thirdparty/VulkanMemoryAllocator
+          git -C mslang submodule update --init thirdparty/slang
+          git -C mslang/thirdparty/slang submodule update --init
+
+      # cargo is needed at build time: mnexus builds vidsynt and
+      # mgpmf builds gpmf_capi from source. The runner image ships
+      # rustup with a stable toolchain; this just makes sure it is
+      # current and on PATH.
+      - name: Rust toolchain
+        run: rustup default stable
+
+      - name: Configure
+        run: cmake -S . -B build
+
+      - name: Build (Release)
+        run: cmake --build build --target routecam --config Release --parallel
+
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          STAGE=routecam-${GITHUB_REF_NAME}-win-x64
+          mkdir -p "$STAGE"
+          cp build/Release/*.exe build/Release/*.dll "$STAGE"/ 2>/dev/null || true
+          cp -r assets "$STAGE"/assets
+          7z a "$STAGE.zip" "$STAGE"
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: routecam-*-win-x64.zip
+          generate_release_notes: true
