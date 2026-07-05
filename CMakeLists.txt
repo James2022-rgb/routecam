@@ -126,8 +126,9 @@ target_link_libraries(${TARGET_NAME} PRIVATE
 )
 
 if(WIN32)
-  # WinHTTP for the OSM tile fetcher.
-  target_link_libraries(${TARGET_NAME} PRIVATE winhttp)
+  # WinHTTP for the OSM tile fetcher; ole32 + uuid for the taskbar
+  # progress bar (ITaskbarList3 via COM).
+  target_link_libraries(${TARGET_NAME} PRIVATE winhttp ole32 uuid)
 endif()
 
 if(WIN32)

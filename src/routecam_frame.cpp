@@ -205,6 +205,35 @@ void RouteCamFrame::OnEvent(mshell::PlatformEvent const& event) {
 #endif
 }
 
+bool RouteCamFrame::TickBackgroundWork() {
+  if (impl_->transcode != nullptr &&
+      impl_->transcode->state() == TranscodeSession::State::kTranscoding) {
+    impl_->transcode->Tick();
+    return true;
+  }
+  return false;
+}
+
+std::optional<RouteCamFrame::BackgroundProgress>
+RouteCamFrame::background_progress() const {
+  if (impl_->transcode == nullptr) return std::nullopt;
+  switch (impl_->transcode->state()) {
+    case TranscodeSession::State::kTranscoding: {
+      uint32_t const total = impl_->transcode->total_frames();
+      float const fraction = total > 0
+        ? static_cast<float>(impl_->transcode->next_frame()) / static_cast<float>(total)
+        : 0.0f;
+      return BackgroundProgress{ .fraction = fraction, .error = false };
+    }
+    case TranscodeSession::State::kError:
+      // Full red bar until the user closes the error in the panel.
+      return BackgroundProgress{ .fraction = 1.0f, .error = true };
+    case TranscodeSession::State::kDone:
+    default:
+      return std::nullopt;
+  }
+}
+
 bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
   if (impl_->transcode != nullptr) {
     MBASE_LOG_WARN("RouteCamFrame::LoadFile: ignored -- transcode in progress");

@@ -2,6 +2,7 @@
 
 // c++ headers ------------------------------------------
 #include <memory>
+#include <optional>
 #include <string>
 
 // public project headers -------------------------------
@@ -27,6 +28,24 @@ public:
   /// by the `SDL_DROPFILE` handler. Returns false if `mp4_path`
   /// could not be opened, in which case the player is left null.
   bool LoadFile(std::string const& mp4_path);
+
+  /// Long-running-work readout for the platform layer (e.g. the
+  /// Windows taskbar progress bar). `fraction` in [0, 1]; `error`
+  /// true when the work aborted (shown until the user dismisses
+  /// it in the panel). `nullopt` when nothing long-running is on.
+  struct BackgroundProgress final {
+    float fraction = 0.0f;
+    bool  error    = false;
+  };
+  std::optional<BackgroundProgress> background_progress() const;
+
+  /// Advances long-running work (the transcode) by one step WITHOUT
+  /// rendering. The platform loop calls this while the window is
+  /// minimized, where the normal OnNewFrame / OnRender path is
+  /// skipped -- a transcode would otherwise stall until restore.
+  /// Returns true when work was done (false = idle; the caller may
+  /// sleep).
+  bool TickBackgroundWork();
 
 private:
   struct Impl;

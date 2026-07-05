@@ -11,6 +11,11 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_syswm.h>
 
+#if MBASE_PLATFORM_WINDOWS
+# include <objbase.h>
+# include <shobjidl.h>
+#endif
+
 // public project headers -------------------------------
 #include "mbase/public/log.h"
 #include "mshell/public/mshell.h"
@@ -28,6 +33,69 @@ std::string FirstFileArg(int argc, char** argv) {
   }
   return std::string{};
 }
+
+#if MBASE_PLATFORM_WINDOWS
+
+/// Windows-taskbar progress bar (the green fill over the taskbar
+/// button) driven by `RouteCamFrame::background_progress`. COM /
+/// ITaskbarList3; failures at any step just disable the feature.
+class TaskbarProgress final {
+public:
+  TaskbarProgress(HWND hwnd) : hwnd_(hwnd) {
+    com_initialized_ = SUCCEEDED(
+      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+    if (!com_initialized_) return;
+    if (FAILED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&taskbar_)))) {
+      taskbar_ = nullptr;
+      return;
+    }
+    if (FAILED(taskbar_->HrInit())) {
+      taskbar_->Release();
+      taskbar_ = nullptr;
+    }
+  }
+
+  ~TaskbarProgress() {
+    if (taskbar_ != nullptr) {
+      taskbar_->SetProgressState(hwnd_, TBPF_NOPROGRESS);
+      taskbar_->Release();
+    }
+    if (com_initialized_) CoUninitialize();
+  }
+
+  void Update(std::optional<routecam::RouteCamFrame::BackgroundProgress> const& progress) {
+    if (taskbar_ == nullptr) return;
+
+    TBPFLAG const state = !progress.has_value() ? TBPF_NOPROGRESS
+                        : progress->error       ? TBPF_ERROR
+                                                : TBPF_NORMAL;
+    ULONGLONG const permille = progress.has_value()
+      ? static_cast<ULONGLONG>(progress->fraction * 1000.0f + 0.5f)
+      : 0ull;
+
+    // Only touch the API when something actually changed; this runs
+    // every frame of the main loop.
+    if (state != last_state_) {
+      taskbar_->SetProgressState(hwnd_, state);
+      last_state_    = state;
+      last_permille_ = ~0ull;
+    }
+    if (state != TBPF_NOPROGRESS && permille != last_permille_) {
+      taskbar_->SetProgressValue(hwnd_, permille, 1000ull);
+      last_permille_ = permille;
+    }
+  }
+
+private:
+  HWND           hwnd_            = nullptr;
+  ITaskbarList3* taskbar_         = nullptr;
+  bool           com_initialized_ = false;
+  TBPFLAG        last_state_      = TBPF_NOPROGRESS;
+  ULONGLONG      last_permille_   = ~0ull;
+};
+
+#endif // MBASE_PLATFORM_WINDOWS
 
 } // namespace
 
@@ -47,6 +115,10 @@ int main(int argc, char** argv) {
 
   mshell::ShellCreateDesc desc{};
   desc.frame = std::make_unique<routecam::RouteCamFrame>(file_arg);
+  // The shell owns the frame; this raw pointer stays valid until
+  // OnFinalize, which the main loop never outlives.
+  routecam::RouteCamFrame* const frame_raw =
+    static_cast<routecam::RouteCamFrame*>(desc.frame.get());
 
   // Leaked on purpose: matches the Emscripten-friendly main-returns-but-
   // runtime-stays-alive pattern. On desktop this is irrelevant; the OS
@@ -83,6 +155,11 @@ int main(int argc, char** argv) {
   };
 
   shell_raw->OnSurfaceRecreated(MakeSurfaceInfo(window));
+
+#if MBASE_PLATFORM_WINDOWS
+  TaskbarProgress taskbar_progress(
+    reinterpret_cast<HWND>(MakeSurfaceInfo(window).window_handle));
+#endif
 
   bool paused = false;
   bool quit   = false;
@@ -125,12 +202,21 @@ int main(int argc, char** argv) {
     }
 
     if (paused) {
-      std::this_thread::yield();
+      // Minimized: no rendering, but long-running work (transcode)
+      // keeps advancing so the taskbar progress keeps filling.
+      if (!frame_raw->TickBackgroundWork()) {
+        SDL_Delay(10);  // idle -- don't spin a core
+      }
     } else {
       shell_raw->OnNewFrame();
       std::this_thread::yield();
       shell_raw->OnTick();
     }
+
+#if MBASE_PLATFORM_WINDOWS
+    // Mirror long-running work (transcode) onto the taskbar button.
+    taskbar_progress.Update(frame_raw->background_progress());
+#endif
   }
 
   SDL_DestroyWindow(window);
