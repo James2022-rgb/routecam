@@ -89,6 +89,8 @@ struct RouteCamFrame::Impl final {
   std::unique_ptr<TranscodeSession>   transcode;
   uint32_t                            transcode_scale = 1;
   std::string                         tile_cache_dir;
+  bool                                auto_transcode_done     = false;
+  bool                                auto_transcode_reported = false;
 
   mnexus::ShaderModuleHandle vs_handle      = {};
   mnexus::ShaderModuleHandle fs_handle      = {};
@@ -289,6 +291,43 @@ bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
 void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
   // Turn finished async tile fetches into textures.
   if (impl_->tile_cache != nullptr) impl_->tile_cache->Update();
+
+  // Unattended-test hook: ROUTECAM_AUTO_TRANSCODE=<scale> starts a
+  // transcode of the loaded file as soon as playback is up, and
+  // logs a marker when it finishes. Lets CI / agents exercise the
+  // transcode path without driving the UI.
+  if (char const* const auto_scale = std::getenv("ROUTECAM_AUTO_TRANSCODE");
+      auto_scale != nullptr && impl_->transcode == nullptr &&
+      impl_->player != nullptr && !impl_->auto_transcode_done) {
+    impl_->auto_transcode_done = true;
+    uint32_t const scale = std::max(1, std::atoi(auto_scale));
+    float view_yaw = 0.0f, view_pitch = 0.0f, view_fov = 90.0f;
+    if (impl_->max2_view != nullptr) {
+      view_yaw   = impl_->max2_view->yaw_degrees();
+      view_pitch = impl_->max2_view->pitch_degrees();
+      view_fov   = impl_->max2_view->fov_degrees();
+    }
+    std::string const input_path = impl_->mp4_path;
+    MBASE_LOG_INFO("RouteCamFrame: AUTO TRANSCODE start (scale 1/{})", scale);
+    impl_->player_1.reset();
+    impl_->player.reset();
+    impl_->transcode = TranscodeSession::Start(impl_->device, TranscodeDesc{
+      .input_path     = input_path,
+      .output_path    = DeriveOverlayOutputPath(input_path),
+      .map_cache_dir  = impl_->tile_cache_dir,
+      .encode_scale   = scale,
+      .view_yaw_deg   = view_yaw,
+      .view_pitch_deg = view_pitch,
+      .view_fov_deg   = view_fov,
+    });
+  }
+  if (impl_->auto_transcode_done && impl_->transcode != nullptr &&
+      !impl_->auto_transcode_reported &&
+      impl_->transcode->state() != TranscodeSession::State::kTranscoding) {
+    impl_->auto_transcode_reported = true;
+    MBASE_LOG_INFO("RouteCamFrame: AUTO TRANSCODE finished ({})",
+      impl_->transcode->state() == TranscodeSession::State::kDone ? "done" : "error");
+  }
 
   // 360 mouse look (drag + wheel outside ImGui windows).
   if (impl_->is_360 && impl_->max2_view != nullptr) {
