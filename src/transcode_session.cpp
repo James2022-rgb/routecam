@@ -21,6 +21,7 @@
 #include "mbase/public/log.h"
 #include "mdemux/public/mp4_aac_audio_demuxer.h"
 #include "mdemux/public/mp4_gpmf_track_demuxer.h"
+#include "mdemux/public/mp4_hevc_video_demuxer.h"
 #include "mdemux/public/mp4_timecode_track_demuxer.h"
 #include "mgpmf/public/gpmf_sample.h"
 #include "mhevcenc/public/hevc_encode_session.h"
@@ -33,6 +34,7 @@
 
 // project headers ---------------------------------------
 #include "hud_draw.h"
+#include "max2_eac_view.h"
 #include "osm_minimap.h"
 
 namespace routecam {
@@ -67,6 +69,12 @@ constexpr float kMapSizePx       = 280.0f;  // at design scale
 // safely be overwritten as soon as that encode CL has read it. We
 // fill slot N while encode CL N-1 is still consuming slot N-1.
 constexpr uint32_t kEncodeInputCount = 2;
+
+// Base (1x scale) output dims for reframed .360 sources. The source
+// EAC storage dims (4096x1344 per track) are meaningless as an
+// output size; a 16:9-class flat window is what a reframe means.
+constexpr uint32_t kReframeBaseWidth  = 1920;
+constexpr uint32_t kReframeBaseHeight = 1080;
 
 mnexus::TextureSubresourceRange ColorRange() {
   return mnexus::TextureSubresourceRange::SingleSubresourceColor(0, 0);
@@ -132,6 +140,11 @@ struct TranscodeSession::Impl final {
 
   // ---- Pipeline components --------------------------------
   std::unique_ptr<mplay::MediaPlayer>              player;
+  // .360 reframe: second HEVC track's player + the EAC renderer +
+  // the flat view target it renders into. All null for flat sources.
+  std::unique_ptr<mplay::MediaPlayer>              player_1;
+  std::unique_ptr<Max2EacView>                     eac_view;
+  bool                                             is_360 = false;
   std::unique_ptr<mdemux::Mp4GpmfTrackDemuxer>     gpmf_demux;
   std::unique_ptr<mdemux::Mp4AacAudioDemuxer>      aac_demux;
   std::unique_ptr<mdemux::Mp4TimecodeTrackDemuxer> tmcd_demux;
@@ -172,8 +185,12 @@ struct TranscodeSession::Impl final {
   mnexus::TextureHandle      scratch_y;
   mnexus::TextureHandle      scratch_cbcr;
   mnexus::TextureHandle      overlay_rgba_tex;
+  mnexus::TextureHandle      view_rgb_tex;  // .360 only: reframed EAC view
   mnexus::BufferHandle       compose_ubo;
   mnexus::SamplerHandle      linear_sampler;
+  // Flat path: NV12 + overlay -> Y / CbCr. 360 path: reframed RGB +
+  // overlay -> Y / CbCr. Only the pair matching the source is
+  // compiled.
   mnexus::ShaderModuleHandle compose_y_vs;
   mnexus::ShaderModuleHandle compose_y_fs;
   mnexus::ShaderModuleHandle compose_cbcr_vs;
@@ -233,6 +250,8 @@ struct TranscodeSession::Impl final {
     cached_gpmf.reset();
     osm_minimap_local.reset();
     route.clear();
+    eac_view.reset();  // frees its own device resources; device must still be alive
+    player_1.reset();
     player.reset();
 
     if (overlay_drawlist != nullptr) {
@@ -250,6 +269,7 @@ struct TranscodeSession::Impl final {
       if (linear_sampler.IsValid())       device->DestroySampler(linear_sampler);
       if (compose_ubo.IsValid())          device->DestroyBuffer(compose_ubo);
       if (overlay_rgba_tex.IsValid())     device->DestroyTexture(overlay_rgba_tex);
+      if (view_rgb_tex.IsValid())         device->DestroyTexture(view_rgb_tex);
       if (minimap_local_tex.IsValid())    device->DestroyTexture(minimap_local_tex);
       DestroyEncodeResources();
     }
@@ -302,6 +322,30 @@ struct TranscodeSession::Impl final {
       return false;
     }
 
+    // ----- .360 detection (dual HEVC tracks) ----------------
+    if (mdemux::CountHevcVideoTracks(desc.input_path) >= 2) {
+      player_1 = mplay::MediaPlayer::Open(device, mplay::OpenMp4Desc{
+        .path                 = desc.input_path,
+        .video_track_index    = 1,
+        .enable_audio         = false,
+        .enable_decode_timing = false,
+      });
+      if (player_1 == nullptr) {
+        MBASE_LOG_ERROR("TranscodeSession: failed to open track 1 of dual-track source");
+        return false;
+      }
+      eac_view = Max2EacView::Create(device);
+      if (eac_view == nullptr) {
+        MBASE_LOG_ERROR("TranscodeSession: Max2EacView::Create failed");
+        return false;
+      }
+      eac_view->SetView(desc.view_yaw_deg, desc.view_pitch_deg, desc.view_fov_deg);
+      is_360 = true;
+      player_1->SetAutoPlay(false);
+      MBASE_LOG_INFO("TranscodeSession: .360 reframe -- yaw {:.1f} pitch {:.1f} fov {:.1f}",
+        desc.view_yaw_deg, desc.view_pitch_deg, desc.view_fov_deg);
+    }
+
     // ---- GPMF telemetry side-channel -----------------------
     gpmf_demux = mdemux::Mp4GpmfTrackDemuxer::Open(desc.input_path);
     if (gpmf_demux == nullptr) {
@@ -333,15 +377,21 @@ struct TranscodeSession::Impl final {
     });
     if (!linear_sampler.IsValid()) return false;
 
-    compose_y_vs = CompileSlangModule(device, "compose_nv12_to_y.slang", "compose_y", "vertex_main");
-    compose_y_fs = CompileSlangModule(device, "compose_nv12_to_y.slang", "compose_y", "fragment_main");
+    // Flat sources compose from the decoded NV12 planes; .360
+    // sources compose from the reframed RGB view.
+    char const* const y_asset    = is_360 ? "compose_rgb_to_y.slang"    : "compose_nv12_to_y.slang";
+    char const* const y_module   = is_360 ? "compose_rgb_y"             : "compose_y";
+    char const* const cc_asset   = is_360 ? "compose_rgb_to_cbcr.slang" : "compose_nv12_to_cbcr.slang";
+    char const* const cc_module  = is_360 ? "compose_rgb_cbcr"          : "compose_cbcr";
+    compose_y_vs = CompileSlangModule(device, y_asset, y_module, "vertex_main");
+    compose_y_fs = CompileSlangModule(device, y_asset, y_module, "fragment_main");
     {
       std::array<mnexus::ShaderModuleHandle, 2> mods{ compose_y_vs, compose_y_fs };
       compose_y_program = device->CreateProgram(mnexus::ProgramDesc{ .shader_modules = mods });
       if (!compose_y_program.IsValid()) return false;
     }
-    compose_cbcr_vs = CompileSlangModule(device, "compose_nv12_to_cbcr.slang", "compose_cbcr", "vertex_main");
-    compose_cbcr_fs = CompileSlangModule(device, "compose_nv12_to_cbcr.slang", "compose_cbcr", "fragment_main");
+    compose_cbcr_vs = CompileSlangModule(device, cc_asset, cc_module, "vertex_main");
+    compose_cbcr_fs = CompileSlangModule(device, cc_asset, cc_module, "fragment_main");
     {
       std::array<mnexus::ShaderModuleHandle, 2> mods{ compose_cbcr_vs, compose_cbcr_fs };
       compose_cbcr_program = device->CreateProgram(mnexus::ProgramDesc{ .shader_modules = mods });
@@ -354,9 +404,11 @@ struct TranscodeSession::Impl final {
     // Round down to a multiple of 16 to satisfy HEVC CTU + chroma
     // 4:2:0 alignment.
     auto align_down = [](uint32_t v, uint32_t a) { return (v / a) * a; };
-    uint32_t const scale = desc.encode_scale != 0 ? desc.encode_scale : 1u;
-    encode_width  = align_down(eff_width  / scale, 16);
-    encode_height = align_down(eff_height / scale, 16);
+    uint32_t const scale  = desc.encode_scale != 0 ? desc.encode_scale : 1u;
+    uint32_t const base_w = is_360 ? kReframeBaseWidth  : eff_width;
+    uint32_t const base_h = is_360 ? kReframeBaseHeight : eff_height;
+    encode_width  = align_down(base_w / scale, 16);
+    encode_height = align_down(base_h / scale, 16);
     if (encode_width == 0u || encode_height == 0u) {
       MBASE_LOG_ERROR("TranscodeSession: encode dims collapse to zero at scale 1/{}", scale);
       return false;
@@ -378,6 +430,25 @@ struct TranscodeSession::Impl final {
       .array_layer_count = 1,
     });
     if (!overlay_rgba_tex.IsValid()) return false;
+
+    // .360: offscreen target the EAC shader reframes into, sampled
+    // by the compose_rgb_to_* shaders. View + dims are fixed for the
+    // whole run, so the EAC UBO is written exactly once here.
+    if (is_360) {
+      view_rgb_tex = device->CreateTexture(mnexus::TextureDesc{
+        .usage             = mnexus::TextureUsageFlagBits::kAttachment
+                           | mnexus::TextureUsageFlagBits::kSampled,
+        .format            = mnexus::Format::kR8G8B8A8_UNORM,
+        .dimension         = mnexus::TextureDimension::k2D,
+        .width             = encode_width,
+        .height            = encode_height,
+        .depth             = 1,
+        .mip_level_count   = 1,
+        .array_layer_count = 1,
+      });
+      if (!view_rgb_tex.IsValid()) return false;
+      eac_view->WriteTargetUbo(encode_width, encode_height);
+    }
 
     if (!AllocateEncodeResources()) {
       MBASE_LOG_ERROR("TranscodeSession: AllocateEncodeResources failed");
@@ -474,9 +545,11 @@ struct TranscodeSession::Impl final {
         s.cts, s.duration, /*is_sync=*/true);
     }
 
-    // One-time UBO upload: rotation matrix + overlay rect.
+    // One-time UBO upload: rotation matrix + overlay rect. The
+    // reframed .360 view is already upright (the rotation rows are
+    // unused by the compose_rgb_to_* shaders anyway).
     {
-      uint32_t const rot = source_rotation_degrees;
+      uint32_t const rot = is_360 ? 0u : source_rotation_degrees;
       float a = 1.0f, b = 0.0f, c = 0.0f, d = 1.0f;
       switch (rot) {
         case   0: a =  1.0f; b =  0.0f; c =  0.0f; d =  1.0f; break;
@@ -819,12 +892,17 @@ struct TranscodeSession::Impl final {
       stage_clock = now;
     };
 
-    // ---- 1. mplay decode --------------------------------
+    // ---- 1. mplay decode (both tracks for .360) ---------
     if (frame_n > 0) {
       player->SeekToDisplayIndex(frame_n);
+      if (is_360) player_1->SeekToDisplayIndex(frame_n);
     }
     player->Update();
     player->Render();
+    if (is_360) {
+      player_1->Update();
+      player_1->Render();
+    }
     take_stage_ms(timing.decode_ms_sum, timing.decode_ms_n);
 
     // ---- 2. Overlay ImDrawList for this frame's PTS ------
@@ -842,8 +920,13 @@ struct TranscodeSession::Impl final {
 
     overlay_renderer->UpdateGeometryBuffers(device, &dd);
 
-    mnexus::TextureHandle const y_tex    = player->current_y_texture();
-    mnexus::TextureHandle const cbcr_tex = player->current_cbcr_texture();
+    // Compose-pass binding-0 sources: the decoded NV12 planes for a
+    // flat run, the reframed RGB view for a .360 run (bound to both
+    // the Y and CbCr passes; the render below fills it).
+    mnexus::TextureHandle const y_src =
+      is_360 ? view_rgb_tex : player->current_y_texture();
+    mnexus::TextureHandle const cbcr_src =
+      is_360 ? view_rgb_tex : player->current_cbcr_texture();
 
     // ---- 3. gfx CL: overlay RT + compose + copy + release ----
     mnexus::ICommandList* gfx_cl = device->CreateCommandList(
@@ -877,6 +960,17 @@ struct TranscodeSession::Impl final {
       mnexus::ResourceBarrierStageFlagBits::kFragmentShader,
       mnexus::ResourceBarrierState::kReadOnly);
 
+    // 3c'. .360: reframe both EAC tracks into the flat view target,
+    // then make it readable by the compose passes.
+    if (is_360) {
+      eac_view->DrawIntoTarget(gfx_cl, view_rgb_tex,
+        player->current_y_texture(),   player->current_cbcr_texture(),
+        player_1->current_y_texture(), player_1->current_cbcr_texture());
+      gfx_cl->TextureBarrier(view_rgb_tex, ColorRange(),
+        mnexus::ResourceBarrierStageFlagBits::kFragmentShader,
+        mnexus::ResourceBarrierState::kReadOnly);
+    }
+
     // 3d. Compose Y plane -> scratch_y.
     gfx_cl->TextureBarrier(scratch_y, ColorRange(),
       mnexus::ResourceBarrierStageFlagBits::kColorAttachmentOutput,
@@ -892,7 +986,7 @@ struct TranscodeSession::Impl final {
       gfx_cl->BindRenderProgram(compose_y_program);
       gfx_cl->BindSampledTexture(
         mnexus::BindingId{ .group = 0, .binding = 0, .array_element = 0 },
-        y_tex, ColorRange());
+        y_src, ColorRange());
       gfx_cl->BindSampledTexture(
         mnexus::BindingId{ .group = 0, .binding = 1, .array_element = 0 },
         overlay_rgba_tex, ColorRange());
@@ -921,7 +1015,7 @@ struct TranscodeSession::Impl final {
       gfx_cl->BindRenderProgram(compose_cbcr_program);
       gfx_cl->BindSampledTexture(
         mnexus::BindingId{ .group = 0, .binding = 0, .array_element = 0 },
-        cbcr_tex, ColorRange());
+        cbcr_src, ColorRange());
       gfx_cl->BindSampledTexture(
         mnexus::BindingId{ .group = 0, .binding = 1, .array_element = 0 },
         overlay_rgba_tex, ColorRange());

@@ -16,15 +16,28 @@ struct TranscodeDesc final {
   /// OSM tile disk cache (same layout / directory as `OsmTileCache`).
   std::string map_cache_dir;
   /// Encode-side downsample factor (1 = native, 2 = half, 4 =
-  /// quarter). The dominant lever on encode throughput.
+  /// quarter). The dominant lever on encode throughput. For .360
+  /// sources the base (1x) output is 1920x1080-class instead of the
+  /// source EAC storage dims.
   uint32_t    encode_scale = 1;
+  /// Reframe view for .360 sources: the fixed yaw / pitch / FOV the
+  /// whole run is rendered with (typically the playback view at the
+  /// moment Start was pressed). Ignored for flat sources.
+  float       view_yaw_deg   = 0.0f;
+  float       view_pitch_deg = 0.0f;
+  float       view_fov_deg   = 90.0f;
 };
 
 /// One burn-in transcode run: decodes the source with mplay, draws
-/// the telemetry dashboard (speedometer + GPS readouts + OSM route
-/// maps) into an offscreen overlay, composes it over the video into
-/// NV12 encode input, re-encodes with Vulkan Video (mhevcenc), and
-/// muxes video + passthrough AAC / GPMF / tmcd tracks (mmux).
+/// the telemetry HUD (speed gauge + minimap) into an offscreen
+/// overlay, composes it over the video into NV12 encode input,
+/// re-encodes with Vulkan Video (mhevcenc), and muxes video +
+/// passthrough AAC / GPMF / tmcd tracks (mmux).
+///
+/// Dual-HEVC-track sources (GoPro Max 2 .360) are detected
+/// automatically: both tracks are decoded and the EAC mouse-look
+/// shader reframes them into a fixed flat view (`view_*` in the
+/// desc) before the HUD composite.
 ///
 /// Owns its own `mplay::MediaPlayer` (audio disabled). The caller
 /// MUST destroy any other player on the same file before `Start`

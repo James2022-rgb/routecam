@@ -476,14 +476,18 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
       // ----- Burn-in transcode launcher -----------------
       ImGui::Separator();
       if (ImGui::CollapsingHeader("Transcode (burn-in overlay)")) {
-        if (impl_->is_360) {
-          ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
-            ".360 transcode (reframed output) is not supported yet.");
-        } else if (info.bit_depth != 8) {
+        if (info.bit_depth != 8) {
           ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
             "%u-bit source -- only 8-bit (SDR) can be transcoded for now.",
             info.bit_depth);
         } else {
+          if (impl_->is_360 && impl_->max2_view != nullptr) {
+            ImGui::TextDisabled(
+              "Reframed with the CURRENT view: yaw %+.1f  pitch %+.1f  fov %.1f (1920x1080 base)",
+              impl_->max2_view->yaw_degrees(),
+              impl_->max2_view->pitch_degrees(),
+              impl_->max2_view->fov_degrees());
+          }
           static char const* const kScaleLabels[] = { "1x (native)", "1/2x (half)", "1/4x (quarter)" };
           static uint32_t   const  kScaleValues[] = { 1u, 2u, 4u };
           int scale_idx = 0;
@@ -498,14 +502,25 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
 
           if (ImGui::Button("Start Transcode")) {
             std::string const input_path = impl_->mp4_path;
-            // Free the playback decode session before the transcode
+            // Freeze the playback view for the .360 reframe.
+            float view_yaw = 0.0f, view_pitch = 0.0f, view_fov = 90.0f;
+            if (impl_->max2_view != nullptr) {
+              view_yaw   = impl_->max2_view->yaw_degrees();
+              view_pitch = impl_->max2_view->pitch_degrees();
+              view_fov   = impl_->max2_view->fov_degrees();
+            }
+            // Free the playback decode sessions before the transcode
             // opens its own (NVDEC session limits).
+            impl_->player_1.reset();
             impl_->player.reset();
             impl_->transcode = TranscodeSession::Start(impl_->device, TranscodeDesc{
-              .input_path    = input_path,
-              .output_path   = output_path,
-              .map_cache_dir = impl_->tile_cache_dir,
-              .encode_scale  = impl_->transcode_scale,
+              .input_path     = input_path,
+              .output_path    = output_path,
+              .map_cache_dir  = impl_->tile_cache_dir,
+              .encode_scale   = impl_->transcode_scale,
+              .view_yaw_deg   = view_yaw,
+              .view_pitch_deg = view_pitch,
+              .view_fov_deg   = view_fov,
             });
             if (impl_->transcode == nullptr) {
               MBASE_LOG_WARN("RouteCamFrame: TranscodeSession::Start failed; restoring playback");

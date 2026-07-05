@@ -70,6 +70,83 @@ struct Max2EacView::Impl final {
       if (vs_handle.IsValid())      device->DestroyShaderModule(vs_handle);
     }
   }
+
+  /// Uploads the view UBO. `output_kind`: 0 = sRGB target (HW OETF),
+  /// 1 = UNORM target (shader applies the sRGB OETF).
+  void WriteUbo(float aspect, float output_kind) {
+    // View rotation = R_yaw(z-axis) * R_pitch(x-axis) applied to a
+    // camera-space ray (initially looking down +y).
+    float const yaw_rad   = DegToRad(yaw_deg);
+    float const pitch_rad = DegToRad(pitch_deg);
+    float const cy = std::cos(yaw_rad),   sy = std::sin(yaw_rad);
+    float const cp = std::cos(pitch_rad), sp = std::sin(pitch_rad);
+    float const r00 = cy;    float const r01 = -sy * cp;  float const r02 =  sy * sp;
+    float const r10 = sy;    float const r11 =  cy * cp;  float const r12 = -cy * sp;
+    float const r20 = 0.0f;  float const r21 =  sp;       float const r22 =  cp;
+
+    float const fov_t = std::tan(DegToRad(fov_deg) * 0.5f);
+
+    // NDC y sign: the shader treats +ndc.y as "screen up"; Vulkan's
+    // default has +ndc.y pointing DOWN after the viewport flip.
+    float const ndc_y_sign = clip_space_y_down ? -1.0f : +1.0f;
+
+    float const ubo_data[24] = {
+      r00, r01, r02, 0.0f,                     // u_view_rot_r0
+      r10, r11, r12, 0.0f,                     // u_view_rot_r1
+      r20, r21, r22, 0.0f,                     // u_view_rot_r2
+      fov_t, aspect, ndc_y_sign, output_kind,  // u_view_params
+      kCol0Left, kCol1Left, kCol2Left, 0.0f,   // u_face_x_left
+      kCol0W,    kCol1W,    kCol2W,    0.0f,   // u_face_x_width
+    };
+    device->QueueWriteBuffer({}, ubo_handle, 0, ubo_data, sizeof(ubo_data));
+  }
+
+  /// Records barrier + clear + fullscreen EAC draw into `cl`.
+  void RecordPass(mnexus::ICommandList* cl, mnexus::TextureHandle target,
+                  mnexus::TextureHandle t0_y, mnexus::TextureHandle t0_cbcr,
+                  mnexus::TextureHandle t1_y, mnexus::TextureHandle t1_cbcr) {
+    cl->TextureBarrier(
+      target,
+      mnexus::TextureSubresourceRange::SingleSubresourceColor(0, 0),
+      mnexus::ResourceBarrierStageFlagBits::kColorAttachmentOutput,
+      mnexus::ResourceBarrierState::kAttachment);
+
+    mnexus::ClearValue clear{};
+    clear.color.r = 0.0f; clear.color.g = 0.0f; clear.color.b = 0.0f; clear.color.a = 1.0f;
+    mnexus::ColorAttachmentDesc const color{
+      .texture           = target,
+      .subresource_range = mnexus::TextureSubresourceRange::SingleSubresourceColor(0, 0),
+      .load_op           = mnexus::LoadOp::kClear,
+      .store_op          = mnexus::StoreOp::kStore,
+      .clear_value       = clear,
+    };
+    cl->BeginRenderPass(mnexus::RenderPassDesc{
+      .color_attachments = color,
+    });
+
+    cl->BindRenderProgram(program_handle);
+
+    auto const subres = mnexus::TextureSubresourceRange::SingleSubresourceColor(0, 0);
+    cl->BindSampledTexture(
+      mnexus::BindingId{ .group = 0, .binding = 0, .array_element = 0 }, t0_y, subres);
+    cl->BindSampledTexture(
+      mnexus::BindingId{ .group = 0, .binding = 1, .array_element = 0 }, t0_cbcr, subres);
+    cl->BindSampledTexture(
+      mnexus::BindingId{ .group = 0, .binding = 2, .array_element = 0 }, t1_y, subres);
+    cl->BindSampledTexture(
+      mnexus::BindingId{ .group = 0, .binding = 3, .array_element = 0 }, t1_cbcr, subres);
+    cl->BindSampler(
+      mnexus::BindingId{ .group = 0, .binding = 4, .array_element = 0 },
+      sampler_handle);
+    cl->BindUniformBuffer(
+      mnexus::BindingId{ .group = 0, .binding = 5, .array_element = 0 },
+      ubo_handle, 0, 96);
+
+    // Fullscreen triangle.
+    cl->Draw(3, 1, 0, 0);
+
+    cl->EndRenderPass();
+  }
 };
 
 std::unique_ptr<Max2EacView> Max2EacView::Create(mnexus::IDevice* device) {
@@ -191,87 +268,40 @@ void Max2EacView::Render(mshell::RenderContext const& ctx,
                          mnexus::TextureHandle t1_y, mnexus::TextureHandle t1_cbcr) {
   Impl& impl = *impl_;
 
-  // ----- UBO -----
-  {
-    // View rotation = R_yaw(z-axis) * R_pitch(x-axis) applied to a
-    // camera-space ray (initially looking down +y).
-    float const yaw_rad   = DegToRad(impl.yaw_deg);
-    float const pitch_rad = DegToRad(impl.pitch_deg);
-    float const cy = std::cos(yaw_rad),   sy = std::sin(yaw_rad);
-    float const cp = std::cos(pitch_rad), sp = std::sin(pitch_rad);
-    float const r00 = cy;    float const r01 = -sy * cp;  float const r02 =  sy * sp;
-    float const r10 = sy;    float const r11 =  cy * cp;  float const r12 = -cy * sp;
-    float const r20 = 0.0f;  float const r21 =  sp;       float const r22 =  cp;
+  mnexus::TextureDesc swapchain_desc{};
+  ctx.device->GetTextureDesc(ctx.swapchain_texture, swapchain_desc);
+  float const sw_w = static_cast<float>(swapchain_desc.width);
+  float const sw_h = static_cast<float>(swapchain_desc.height);
+  float const aspect = (sw_h > 0.0f) ? (sw_w / sw_h) : 1.0f;
 
-    mnexus::TextureDesc swapchain_desc{};
-    ctx.device->GetTextureDesc(ctx.swapchain_texture, swapchain_desc);
-    float const sw_w = static_cast<float>(swapchain_desc.width);
-    float const sw_h = static_cast<float>(swapchain_desc.height);
-    float const aspect = (sw_h > 0.0f) ? (sw_w / sw_h) : 1.0f;
-    float const fov_t = std::tan(DegToRad(impl.fov_deg) * 0.5f);
+  bool const swapchain_is_srgb =
+    swapchain_desc.format == mnexus::Format::kR8G8B8A8_SRGB ||
+    swapchain_desc.format == mnexus::Format::kB8G8R8A8_SRGB;
 
-    bool const swapchain_is_srgb =
-      swapchain_desc.format == mnexus::Format::kR8G8B8A8_SRGB ||
-      swapchain_desc.format == mnexus::Format::kB8G8R8A8_SRGB;
-    float const output_kind = swapchain_is_srgb ? 0.0f : 1.0f;
+  impl.WriteUbo(aspect, swapchain_is_srgb ? 0.0f : 1.0f);
+  impl.RecordPass(ctx.command_list, ctx.swapchain_texture,
+                  t0_y, t0_cbcr, t1_y, t1_cbcr);
+}
 
-    // NDC y sign: the shader treats +ndc.y as "screen up"; Vulkan's
-    // default has +ndc.y pointing DOWN after the viewport flip.
-    float const ndc_y_sign = impl.clip_space_y_down ? -1.0f : +1.0f;
+void Max2EacView::SetView(float yaw_deg, float pitch_deg, float fov_deg) {
+  impl_->yaw_deg   = yaw_deg;
+  impl_->pitch_deg = pitch_deg;
+  impl_->fov_deg   = fov_deg;
+}
 
-    float const ubo_data[24] = {
-      r00, r01, r02, 0.0f,                     // u_view_rot_r0
-      r10, r11, r12, 0.0f,                     // u_view_rot_r1
-      r20, r21, r22, 0.0f,                     // u_view_rot_r2
-      fov_t, aspect, ndc_y_sign, output_kind,  // u_view_params
-      kCol0Left, kCol1Left, kCol2Left, 0.0f,   // u_face_x_left
-      kCol0W,    kCol1W,    kCol2W,    0.0f,   // u_face_x_width
-    };
-    impl.device->QueueWriteBuffer({}, impl.ubo_handle, 0, ubo_data, sizeof(ubo_data));
-  }
+void Max2EacView::WriteTargetUbo(uint32_t width, uint32_t height) {
+  float const aspect = height > 0
+    ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+  // UNORM offscreen target: the shader applies the sRGB OETF, so
+  // the stored bytes are R'G'B' as the compose shaders expect.
+  impl_->WriteUbo(aspect, /*output_kind=*/1.0f);
+}
 
-  // ----- Swapchain pass -----
-  ctx.command_list->TextureBarrier(
-    ctx.swapchain_texture,
-    mnexus::TextureSubresourceRange::SingleSubresourceColor(0, 0),
-    mnexus::ResourceBarrierStageFlagBits::kColorAttachmentOutput,
-    mnexus::ResourceBarrierState::kAttachment);
-
-  mnexus::ClearValue clear{};
-  clear.color.r = 0.0f; clear.color.g = 0.0f; clear.color.b = 0.0f; clear.color.a = 1.0f;
-  mnexus::ColorAttachmentDesc const color{
-    .texture           = ctx.swapchain_texture,
-    .subresource_range = mnexus::TextureSubresourceRange::SingleSubresourceColor(0, 0),
-    .load_op           = mnexus::LoadOp::kClear,
-    .store_op          = mnexus::StoreOp::kStore,
-    .clear_value       = clear,
-  };
-  ctx.command_list->BeginRenderPass(mnexus::RenderPassDesc{
-    .color_attachments = color,
-  });
-
-  ctx.command_list->BindRenderProgram(impl.program_handle);
-
-  auto const subres = mnexus::TextureSubresourceRange::SingleSubresourceColor(0, 0);
-  ctx.command_list->BindSampledTexture(
-    mnexus::BindingId{ .group = 0, .binding = 0, .array_element = 0 }, t0_y, subres);
-  ctx.command_list->BindSampledTexture(
-    mnexus::BindingId{ .group = 0, .binding = 1, .array_element = 0 }, t0_cbcr, subres);
-  ctx.command_list->BindSampledTexture(
-    mnexus::BindingId{ .group = 0, .binding = 2, .array_element = 0 }, t1_y, subres);
-  ctx.command_list->BindSampledTexture(
-    mnexus::BindingId{ .group = 0, .binding = 3, .array_element = 0 }, t1_cbcr, subres);
-  ctx.command_list->BindSampler(
-    mnexus::BindingId{ .group = 0, .binding = 4, .array_element = 0 },
-    impl.sampler_handle);
-  ctx.command_list->BindUniformBuffer(
-    mnexus::BindingId{ .group = 0, .binding = 5, .array_element = 0 },
-    impl.ubo_handle, 0, 96);
-
-  // Fullscreen triangle.
-  ctx.command_list->Draw(3, 1, 0, 0);
-
-  ctx.command_list->EndRenderPass();
+void Max2EacView::DrawIntoTarget(mnexus::ICommandList* cl,
+                                 mnexus::TextureHandle target,
+                                 mnexus::TextureHandle t0_y, mnexus::TextureHandle t0_cbcr,
+                                 mnexus::TextureHandle t1_y, mnexus::TextureHandle t1_cbcr) {
+  impl_->RecordPass(cl, target, t0_y, t0_cbcr, t1_y, t1_cbcr);
 }
 
 float Max2EacView::yaw_degrees() const   { return impl_->yaw_deg; }

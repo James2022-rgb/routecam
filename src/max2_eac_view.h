@@ -49,6 +49,26 @@ public:
   float pitch_degrees() const;
   float fov_degrees() const;
 
+  /// Overrides the view. Used by the transcoder to freeze the
+  /// playback view for a reframe run.
+  void SetView(float yaw_deg, float pitch_deg, float fov_deg);
+
+  /// Writes the view UBO for an offscreen RGBA8 UNORM target of the
+  /// given dimensions (gamma-encoded output, aspect = w / h). The
+  /// view + dims stay constant across a transcode run, so call this
+  /// ONCE before the first `DrawIntoTarget` -- per-frame rewrites
+  /// would race the previous frame's in-flight draw.
+  void WriteTargetUbo(uint32_t width, uint32_t height);
+
+  /// Records the reframed-view pass into `cl`: transitions `target`
+  /// to attachment, clears, and draws the fullscreen EAC triangle.
+  /// The caller barriers `target` to a sampleable state afterwards.
+  /// Uses the UBO last written by `WriteTargetUbo`.
+  void DrawIntoTarget(mnexus::ICommandList* cl,
+                      mnexus::TextureHandle target,
+                      mnexus::TextureHandle t0_y, mnexus::TextureHandle t0_cbcr,
+                      mnexus::TextureHandle t1_y, mnexus::TextureHandle t1_cbcr);
+
 private:
   Max2EacView() = default;
 
