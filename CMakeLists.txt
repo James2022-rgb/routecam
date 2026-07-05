@@ -91,6 +91,8 @@ set(SOURCES
   ${SOURCE_DIR}/hud_draw.cpp
   ${SOURCE_DIR}/hud_draw.h
   ${SOURCE_DIR}/main.cpp
+  ${SOURCE_DIR}/max2_eac_view.cpp
+  ${SOURCE_DIR}/max2_eac_view.h
   ${SOURCE_DIR}/minimap.cpp
   ${SOURCE_DIR}/minimap.h
   ${SOURCE_DIR}/osm_minimap.cpp

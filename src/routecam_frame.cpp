@@ -20,6 +20,7 @@
 #include "mbase/public/assert.h"
 #include "mbase/public/log.h"
 #include "masset/public/masset.h"
+#include "mdemux/public/mp4_hevc_video_demuxer.h"
 #include "mnexus/public/mnexus.h"
 #include "mnexus/public/types.h"
 #include "mplay/public/media_player.h"
@@ -28,6 +29,7 @@
 // project headers ---------------------------------------
 #include "gps_timeline.h"
 #include "hud_draw.h"
+#include "max2_eac_view.h"
 #include "minimap.h"
 #include "osm_tile_cache.h"
 #include "transcode_session.h"
@@ -71,6 +73,12 @@ struct RouteCamFrame::Impl final {
   bool             request_hdr_swapchain = false;
 
   std::unique_ptr<mplay::MediaPlayer> player;
+  // GoPro Max 2 `.360` support: second HEVC track's player (null for
+  // flat files) + the EAC mouse-look renderer (created lazily on the
+  // first `.360` load).
+  std::unique_ptr<mplay::MediaPlayer> player_1;
+  std::unique_ptr<Max2EacView>        max2_view;
+  bool                                is_360 = false;
   std::unique_ptr<GpsTimeline>        gps_timeline;  // null when the file has no GPS
   std::unique_ptr<OsmTileCache>       tile_cache;
   int                                 minimap_zoom = 15;
@@ -169,6 +177,7 @@ void RouteCamFrame::OnAttach(mshell::AttachContext const& ctx) {
 void RouteCamFrame::OnDetach() {
   MBASE_LOG_INFO("RouteCamFrame::OnDetach");
   impl_->transcode.reset();   // drains in-flight encode work
+  impl_->max2_view.reset();
   impl_->tile_cache.reset();  // joins the fetch worker, frees tile textures
   if (impl_->device != nullptr) {
     if (impl_->ubo_handle.IsValid())     impl_->device->DestroyBuffer(impl_->ubo_handle);
@@ -177,6 +186,7 @@ void RouteCamFrame::OnDetach() {
     if (impl_->fs_handle.IsValid())      impl_->device->DestroyShaderModule(impl_->fs_handle);
     if (impl_->vs_handle.IsValid())      impl_->device->DestroyShaderModule(impl_->vs_handle);
   }
+  impl_->player_1.reset();
   impl_->player.reset();
 }
 
@@ -201,10 +211,12 @@ bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
   std::string const path = mp4_path.empty() ? std::string{kFallbackPath} : mp4_path;
   MBASE_LOG_INFO("RouteCamFrame::LoadFile: opening {}", path);
 
-  // Destroy the existing player BEFORE opening the new one (NVDEC
+  // Destroy the existing players BEFORE opening new ones (NVDEC
   // session limits + audio sink double-binding both crash if two
   // players try to coexist across an Open call).
+  impl_->player_1.reset();
   impl_->player.reset();
+  impl_->is_360 = false;
   impl_->gps_timeline.reset();
 
   auto new_player = mplay::MediaPlayer::Open(impl_->device, mplay::OpenMp4Desc{
@@ -223,6 +235,33 @@ bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
 
   // GPS telemetry is optional; null just disables the HUD / map.
   impl_->gps_timeline = GpsTimeline::Load(path);
+
+  // ----- GoPro Max 2 `.360` detection (dual HEVC tracks) -----
+  // Track 0 carries LEFT/FRONT/RIGHT, track 1 DOWN/BACK/TOP; both
+  // share one display index space so seeks can be mirrored. Only
+  // the track 0 player owns the audio path.
+  if (mdemux::CountHevcVideoTracks(path) >= 2) {
+    impl_->player_1 = mplay::MediaPlayer::Open(impl_->device, mplay::OpenMp4Desc{
+      .path                 = path,
+      .video_track_index    = 1,
+      .enable_audio         = false,
+      .enable_decode_timing = false,
+    });
+    if (impl_->player_1 != nullptr) {
+      if (impl_->max2_view == nullptr) {
+        impl_->max2_view = Max2EacView::Create(impl_->device);
+      }
+      if (impl_->max2_view != nullptr) {
+        impl_->is_360 = true;
+        MBASE_LOG_INFO("RouteCamFrame::LoadFile: dual-track EAC (.360) mode");
+      } else {
+        MBASE_LOG_WARN("RouteCamFrame::LoadFile: EAC view unavailable; falling back to flat track 0");
+        impl_->player_1.reset();
+      }
+    } else {
+      MBASE_LOG_WARN("RouteCamFrame::LoadFile: failed to open track 1; falling back to flat track 0");
+    }
+  }
 
   auto const& info = impl_->player->info();
   MBASE_LOG_INFO("RouteCamFrame::LoadFile: {} -- {}x{} {}-bit hdr10={} peak_nits={} frames={} dur={:.2f}s audio={}",
@@ -250,6 +289,11 @@ bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
 void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
   // Turn finished async tile fetches into textures.
   if (impl_->tile_cache != nullptr) impl_->tile_cache->Update();
+
+  // 360 mouse look (drag + wheel outside ImGui windows).
+  if (impl_->is_360 && impl_->max2_view != nullptr) {
+    impl_->max2_view->HandleMouseInput();
+  }
 
   // ----- Main menu bar (File > Open) + Ctrl+O hotkey ----
   bool want_open_dialog = false;
@@ -394,14 +438,28 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
                             monitor_hdr10 ? "" : ", monitor SDR-only");
       }
 
+      if (impl_->is_360 && impl_->max2_view != nullptr) {
+        ImGui::Separator();
+        impl_->max2_view->DrawPanelControls();
+        ImGui::Separator();
+      }
+
       if (total > 0) {
-        if (ImGui::Button("<<")) impl_->player->SeekByDeltaSeconds(-10.0);
+        // Seeks mirror onto the second track's player in .360 mode
+        // (both tracks share one display index space).
+        auto const seek_delta = [this](double delta_secs) {
+          impl_->player->SeekByDeltaSeconds(delta_secs);
+          if (impl_->player_1 != nullptr) {
+            impl_->player_1->SeekToDisplayIndex(impl_->player->current_display_index());
+          }
+        };
+        if (ImGui::Button("<<")) seek_delta(-10.0);
         ImGui::SameLine();
-        if (ImGui::Button("<"))  impl_->player->SeekByDeltaSeconds(-5.0);
+        if (ImGui::Button("<"))  seek_delta(-5.0);
         ImGui::SameLine();
-        if (ImGui::Button(">"))  impl_->player->SeekByDeltaSeconds(+5.0);
+        if (ImGui::Button(">"))  seek_delta(+5.0);
         ImGui::SameLine();
-        if (ImGui::Button(">>")) impl_->player->SeekByDeltaSeconds(+10.0);
+        if (ImGui::Button(">>")) seek_delta(+10.0);
 
         int slider_value = static_cast<int>(cur);
         ImGui::SetNextItemWidth(-1.0f);
@@ -409,13 +467,19 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
                              "Display %d", ImGuiSliderFlags_AlwaysClamp)) {
           impl_->player->SetAutoPlay(false);
           impl_->player->SeekToDisplayIndex(static_cast<uint32_t>(slider_value));
+          if (impl_->player_1 != nullptr) {
+            impl_->player_1->SeekToDisplayIndex(static_cast<uint32_t>(slider_value));
+          }
         }
       }
 
       // ----- Burn-in transcode launcher -----------------
       ImGui::Separator();
       if (ImGui::CollapsingHeader("Transcode (burn-in overlay)")) {
-        if (info.bit_depth != 8) {
+        if (impl_->is_360) {
+          ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+            ".360 transcode (reframed output) is not supported yet.");
+        } else if (info.bit_depth != 8) {
           ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
             "%u-bit source -- only 8-bit (SDR) can be transcoded for now.",
             info.bit_depth);
@@ -533,6 +597,29 @@ void RouteCamFrame::OnRender(mshell::RenderContext const& ctx) {
       .color_attachments = color,
     });
     ctx.command_list->EndRenderPass();
+    return;
+  }
+
+  // ----- 360 (dual-track EAC) path ----------------------
+  if (impl_->is_360 && impl_->player_1 != nullptr && impl_->max2_view != nullptr) {
+    // The track 0 player drives the timeline (audio-master clock
+    // when playing); mirror its display index onto the second
+    // track's player before that one updates. SeekToDisplayIndex is
+    // a no-op when already on the right index, which is most frames
+    // during forward sequential play.
+    impl_->player->Update();
+    uint32_t const target_idx = impl_->player->current_display_index();
+    if (impl_->player_1->current_display_index() != target_idx) {
+      impl_->player_1->SeekToDisplayIndex(target_idx);
+    }
+    impl_->player->Render();
+    impl_->player_1->Update();
+    impl_->player_1->Render();
+
+    impl_->max2_view->Render(
+      ctx,
+      impl_->player->current_y_texture(),   impl_->player->current_cbcr_texture(),
+      impl_->player_1->current_y_texture(), impl_->player_1->current_cbcr_texture());
     return;
   }
 
