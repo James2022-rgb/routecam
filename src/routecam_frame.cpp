@@ -46,6 +46,18 @@ std::string DeriveOverlayOutputPath(std::string const& input_path) {
   return stem + "_overlay.mp4";
 }
 
+// 1484281958 -> "1,484,281,958".
+std::string FormatThousands(uint64_t value) {
+  std::string const digits = std::to_string(value);
+  std::string out;
+  out.reserve(digits.size() + digits.size() / 3);
+  for (size_t i = 0; i < digits.size(); ++i) {
+    if (i != 0 && (digits.size() - i) % 3 == 0) out += ',';
+    out += digits[i];
+  }
+  return out;
+}
+
 void FormatDuration(double secs, char* out, size_t out_capacity) {
   if (secs < 0.0) secs = 0.0;
   uint32_t const total = static_cast<uint32_t>(secs + 0.5);
@@ -435,8 +447,8 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
           ImGui::Text("Speed: %.2fx realtime   elapsed %s   ETA ~%s",
                       speed, buf_elapsed, buf_eta);
         }
-        ImGui::Text("Encoded bytes: %llu",
-                    static_cast<unsigned long long>(ts.encoded_bytes()));
+        ImGui::Text("Encoded bytes: %s",
+                    FormatThousands(ts.encoded_bytes()).c_str());
         auto const st = ts.stage_averages();
         ImGui::TextDisabled("Stage avg ms: decode %.2f  gfx %.2f  wait %.2f  submit %.2f  mux %.2f",
                             st.decode_ms, st.gfx_ms, st.wait_ms, st.submit_ms, st.mux_ms);
@@ -445,9 +457,9 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
         }
       } else if (ts.state() == TranscodeSession::State::kDone) {
         ImGui::TextColored(ImVec4(0.4f, 0.95f, 0.4f, 1.0f),
-          "Done -- %u frames (%llu bytes) in %.0fs:",
+          "Done -- %u frames (%s bytes) in %.0fs:",
           ts.next_frame(),
-          static_cast<unsigned long long>(ts.encoded_bytes()),
+          FormatThousands(ts.encoded_bytes()).c_str(),
           ts.elapsed_seconds());
         ImGui::TextWrapped("%s", ts.output_path().c_str());
         if (ImGui::Button("Close")) {
