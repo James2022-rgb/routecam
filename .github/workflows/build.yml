@@ -94,6 +94,7 @@ jobs:
           mkdir -p "$STAGE"
           cp build/Release/*.exe build/Release/*.dll "$STAGE"/ 2>/dev/null || true
           cp -r assets "$STAGE"/assets
+          cp LICENSE THIRD-PARTY-NOTICES.md "$STAGE"/
           7z a "$STAGE.zip" "$STAGE"
 
       - name: Release
