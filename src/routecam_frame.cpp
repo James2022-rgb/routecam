@@ -38,11 +38,6 @@ namespace routecam {
 
 namespace {
 
-// Fallback when launched with no command-line argument. Picked to
-// match what the playground prototype used so cold-start runs the
-// developer's normal test capture.
-constexpr char const* kFallbackPath = R"(J:\Pics\旅行\GX010005.MP4)";
-
 // "path/name.MP4" -> "path/name_overlay.mp4".
 std::string DeriveOverlayOutputPath(std::string const& input_path) {
   size_t const dot = input_path.find_last_of('.');
@@ -101,7 +96,8 @@ struct RouteCamFrame::Impl final {
 
 RouteCamFrame::RouteCamFrame(std::string initial_path)
   : impl_(std::make_unique<Impl>()) {
-  impl_->mp4_path = initial_path.empty() ? kFallbackPath : std::move(initial_path);
+  // Empty = start with no file open (File > Open / drag-drop).
+  impl_->mp4_path = std::move(initial_path);
 }
 
 RouteCamFrame::~RouteCamFrame() = default;
@@ -171,7 +167,7 @@ void RouteCamFrame::OnAttach(mshell::AttachContext const& ctx) {
     impl_->tile_cache = OsmTileCache::Create(impl_->device, impl_->tile_cache_dir);
   }
 
-  if (!LoadFile(impl_->mp4_path)) {
+  if (!impl_->mp4_path.empty() && !LoadFile(impl_->mp4_path)) {
     MBASE_LOG_WARN("RouteCamFrame::OnAttach: initial LoadFile({}) failed", impl_->mp4_path);
   }
 }
@@ -239,7 +235,10 @@ bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
     MBASE_LOG_WARN("RouteCamFrame::LoadFile: ignored -- transcode in progress");
     return false;
   }
-  std::string const path = mp4_path.empty() ? std::string{kFallbackPath} : mp4_path;
+  if (mp4_path.empty()) {
+    return false;
+  }
+  std::string const path = mp4_path;
   MBASE_LOG_INFO("RouteCamFrame::LoadFile: opening {}", path);
 
   // Destroy the existing players BEFORE opening new ones (NVDEC
