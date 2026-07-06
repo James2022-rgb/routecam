@@ -64,11 +64,30 @@ endif()
 set(MNEXUS_ENABLE_BACKEND_WGPU OFF CACHE BOOL "" FORCE)
 set(MNEXUS_ENABLE_DAWN         OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mnexus       ${CMAKE_CURRENT_BINARY_DIR}/mnexus)
-# SPIRV-Tools (inside mslang's slang) builds with warnings-as-errors
-# by default; newer MSVC toolsets keep introducing warnings that
-# would break the build (e.g. C2220 in small_vector.h on CI).
-set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mslang       ${CMAKE_CURRENT_BINARY_DIR}/mslang)
+
+# SPIRV-Tools (inside mslang's slang) hardcodes /WX into its MSVC
+# warning flags (SPIRV_WERROR merely appends a second /WX), so newer
+# MSVC toolsets break the build whenever they introduce a warning
+# (e.g. small_vector.h C2220 on CI runners). MSVC takes the LAST
+# /WX[-] on the command line, so append /WX- to every target under
+# the spirv-tools directory tree.
+function(routecam_append_wx_minus dir)
+  get_property(_targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_t IN LISTS _targets)
+    get_target_property(_type ${_t} TYPE)
+    if(_type MATCHES "^(STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|OBJECT_LIBRARY|EXECUTABLE)$")
+      target_compile_options(${_t} PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/WX->)
+    endif()
+  endforeach()
+  get_property(_subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+  foreach(_d IN LISTS _subdirs)
+    routecam_append_wx_minus("${_d}")
+  endforeach()
+endfunction()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/mslang/thirdparty/slang/external/spirv-tools/CMakeLists.txt")
+  routecam_append_wx_minus("${CMAKE_CURRENT_SOURCE_DIR}/mslang/thirdparty/slang/external/spirv-tools")
+endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mslang-proxy ${CMAKE_CURRENT_BINARY_DIR}/mslang-proxy)
 
 # Media stack used by RouteCamFrame.
