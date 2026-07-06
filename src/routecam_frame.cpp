@@ -253,7 +253,9 @@ bool RouteCamFrame::LoadFile(std::string const& mp4_path) {
     .path                 = path,
     .video_track_index    = 0,
     .enable_audio         = true,
-    .enable_decode_timing = true,
+    // No decode-stats UI in this app; enabling the timing pool only
+    // produces "Decode spike" log spam on heavy sources.
+    .enable_decode_timing = false,
   });
   if (new_player == nullptr) {
     MBASE_LOG_WARN("RouteCamFrame::LoadFile: open failed for {}", path);
@@ -385,7 +387,11 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
       "Action camera video{.MP4,.mp4,.mov,.MOV,.360}",
       cfg);
   }
-  if (ImGuiFileDialog::Instance()->Display("RouteCamOpenDlg")) {
+  // Give the dialog a usable initial footprint -- the library's
+  // default minimum is a nearly-empty sliver.
+  if (ImGuiFileDialog::Instance()->Display(
+        "RouteCamOpenDlg", ImGuiWindowFlags_NoCollapse,
+        ImVec2(720.0f, 480.0f))) {
     if (ImGuiFileDialog::Instance()->IsOk()) {
       std::string const picked = ImGuiFileDialog::Instance()->GetFilePathName();
       if (!LoadFile(picked)) {
@@ -395,6 +401,8 @@ void RouteCamFrame::OnNewFrame(mshell::NewFrameContext const& /*ctx*/) {
     ImGuiFileDialog::Instance()->Close();
   }
 
+  // A sane first-run size; imgui.ini remembers the user's resize.
+  ImGui::SetNextWindowSize(ImVec2(520.0f, 420.0f), ImGuiCond_FirstUseEver);
   if (ImGui::Begin("RouteCam")) {
     ImGui::TextDisabled("%s", impl_->mp4_path.c_str());
     ImGui::Separator();
