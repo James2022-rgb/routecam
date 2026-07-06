@@ -64,6 +64,10 @@ endif()
 set(MNEXUS_ENABLE_BACKEND_WGPU OFF CACHE BOOL "" FORCE)
 set(MNEXUS_ENABLE_DAWN         OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mnexus       ${CMAKE_CURRENT_BINARY_DIR}/mnexus)
+# SPIRV-Tools (inside mslang's slang) builds with warnings-as-errors
+# by default; newer MSVC toolsets keep introducing warnings that
+# would break the build (e.g. C2220 in small_vector.h on CI).
+set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mslang       ${CMAKE_CURRENT_BINARY_DIR}/mslang)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mslang-proxy ${CMAKE_CURRENT_BINARY_DIR}/mslang-proxy)
 
