@@ -117,7 +117,7 @@ amm-info@iis.fraunhofer.de
 
 ## Other components
 
-- **L-SMASH** -- https://github.com/l-smash/l-smash -- ISC License.
+- **L-SMASH** (vimeo fork) -- https://github.com/vimeo/l-smash -- ISC License.
 - **SDL2** -- https://github.com/libsdl-org/SDL (release-2.30.2) -- zlib License.
 - **Dear ImGui** -- https://github.com/ocornut/imgui -- MIT License. Copyright (c) 2014-2025 Omar Cornut.
 - **ImGuiFileDialog** -- https://github.com/aiekick/ImGuiFileDialog -- MIT License. Copyright (c) 2018-2024 Stephane Cuillerdier (aka Aiekick).
