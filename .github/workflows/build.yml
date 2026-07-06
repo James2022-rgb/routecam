@@ -46,11 +46,41 @@ jobs:
       - name: Rust toolchain
         run: rustup default stable
 
+      # volk (pulled in by mnexus) resolves Vulkan headers through
+      # CMake's FindVulkan, which needs the SDK. The version tracks
+      # the one the app is developed against.
+      - name: Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      # On failure, surface the interesting log lines as check-run
+      # annotations -- they are readable through the public API,
+      # unlike the raw step logs.
       - name: Configure
-        run: cmake -S . -B build
+        shell: bash
+        run: |
+          if ! cmake -S . -B build > cfg.log 2>&1; then
+            msg=$(grep -aB2 -A8 'CMake Error' cfg.log | head -40 || tail -40 cfg.log)
+            [ -n "$msg" ] || msg=$(tail -40 cfg.log)
+            msg=${msg//$'\n'/%0A}
+            echo "::error title=CMake configure failed::${msg:0:3500}"
+            exit 1
+          fi
+          tail -3 cfg.log
 
       - name: Build (Release)
-        run: cmake --build build --target routecam --config Release --parallel
+        shell: bash
+        run: |
+          if ! cmake --build build --target routecam --config Release --parallel > build.log 2>&1; then
+            msg=$(grep -aE ': (fatal )?error|LINK : ' build.log | head -30)
+            [ -n "$msg" ] || msg=$(tail -40 build.log)
+            msg=${msg//$'\n'/%0A}
+            echo "::error title=Build failed::${msg:0:3500}"
+            exit 1
+          fi
+          grep -aE 'routecam\.(exe|vcxproj) ->' build.log | tail -2
 
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
