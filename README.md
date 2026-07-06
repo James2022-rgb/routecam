@@ -4,6 +4,8 @@
 
 <b> View and transcode action-camera footage (GoPro HERO / Max 2) with a GPS speed gauge and OpenStreetMap route overlay </b>
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 [![build](https://github.com/James2022-rgb/routecam/actions/workflows/build.yml/badge.svg)](https://github.com/James2022-rgb/routecam/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/James2022-rgb/routecam)](https://github.com/James2022-rgb/routecam/releases/latest)
 
